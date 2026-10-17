@@ -1,0 +1,35 @@
+ScreenSFSE third-party notices
+
+CommonLibSF
+  https://github.com/libxse/commonlibsf
+  Checked-out commit: 84f8589b15a6d588d28da16baa7459a1fc414ea7
+  Corresponding source: https://github.com/libxse/commonlibsf/tree/84f8589b15a6d588d28da16baa7459a1fc414ea7
+  Download to external/commonlibsf using BUILDING.md.
+  GPL-3.0-or-later with the modding/linking permissions in its EXCEPTIONS.
+  Not bundled here. Upstream source contains COPYING, EXCEPTIONS and other notices.
+
+commonlib-shared
+  https://github.com/libxse/commonlib-shared
+  Checked-out commit: af93af74e9a572aa2af9b10ea9fdd73bf80b3c9c
+  Corresponding source: https://github.com/libxse/commonlib-shared/tree/af93af74e9a572aa2af9b10ea9fdd73bf80b3c9c
+  Download to external/commonlibsf/lib/commonlib-shared using BUILDING.md.
+  Not bundled here. Upstream source contains LICENSE and source notices.
+  This is the actual local submodule checkout used by ScreenSFSE, which differs
+  from the pointer recorded in the CommonLibSF parent commit.
+
+SFSE PluginAPI.h
+  https://github.com/ianpatt/sfse
+  Source checkout: 48535cc4306ab345252bf740c20a1c6194929b0e
+  Copyright (c) 2023 Ian Patterson. MIT license for PluginAPI.h.
+  The unchanged header and upstream LICENSE are in external/sfse.
+  No other SFSE implementation files are included. The single runtime-number
+  shim is original ScreenSFSE build support under ScreenSFSE's license.
+
+External runtime tools
+  yt-dlp, FFmpeg and Deno are user-installed executables, not included here.
+  Their respective licenses apply to them. Windows/DirectX/Media Foundation,
+  Starfield, SFSE, Address Library, and Creation Kit are separately obtained.
+
+Game assets and media
+  Bethesda assets and user videos are not included in this source repository.
+  No rights to that third-party content are granted by ScreenSFSE's license.

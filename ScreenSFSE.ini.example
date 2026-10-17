@@ -1,0 +1,48 @@
+; ScreenSFSE settings. tools/build_assets.py writes the staged copy, filling the surface size from config/screen.json.
+; The log is at Documents\My Games\Starfield\SFSE\Logs\ScreenSFSE.log.
+
+[General]
+LogLevel=Info
+
+[Surface]
+; Screen channels are built in (src\screen_channels.h, from config\screen.json): each screen variant's placeholder
+; texture is recognised in D3D12 by its exact size. Formats are DXGI numbers: 27 R8G8B8A8_TYPELESS, 28 _UNORM, 29 _SRGB.
+Formats=27,28,29
+
+[Render]
+Enabled=true
+; Frames written into the screen per second (1-60).
+FPS=30
+; Create the screen texture with simultaneous access, so frames are copied in without state transitions.
+SimultaneousAccess=true
+; Only used when the texture is not simultaneous-access: the state it is assumed to be in between frames.
+AssumedState=0xC0
+; Log 2D textures that have the screen's width or height but are not matched (first 40), to diagnose a miss.
+LogNearMisses=true
+
+[Video]
+Enabled=true
+; Playlists, in menu order ("Next Playlist" cycles through them), like the radio's stations: playlist=Name|Source
+; Source: a YouTube playlist or video URL (each video is downloaded once with yt-dlp into <root>\Cache as an H.264
+; MP4; the next one is prefetched), or a folder / video file (absolute, or relative to the root folder).
+; A "My Videos" playlist for <root>\Videos is always added at the end.
+playlist=Vangelis|https://www.youtube.com/watch?v=f2Bp-xkMc20
+; Root folder for videos (Videos), the YouTube cache (Cache), tools (Tools) and the saved sessions. Empty: Data\VideoScreen
+; in the game folder (like the radio's Data\Radio). A relative path is relative to the game folder.
+root_path=
+; Tools. Empty: RadioSFSE.ini's ytdlp_path / ffmpeg_path / deno_path, then <root>\Tools, then PATH.
+ytdlp_path=
+ffmpeg_path=
+deno_path=
+; Highest YouTube video height downloaded (H.264).
+max_height=720
+; Sound: starting volume (0-1; the menu's Volume +/- is remembered), step of Volume +/-, and the distance fade:
+; full volume within full_volume_meters of the screen, silent from silent_meters.
+volume=0.8
+volume_step=0.1
+full_volume_meters=2
+silent_meters=25
+; Back / Forward jump, in seconds.
+seek_seconds=30
+; YouTube live streams: seconds of stream kept ahead (covers network hiccups; the live picture is that much later).
+live_buffer_seconds=5

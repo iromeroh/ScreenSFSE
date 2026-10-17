@@ -1,0 +1,5 @@
+LIBRARY ScreenSFSE
+
+EXPORTS
+    SFSEPlugin_Load
+    SFSEPlugin_Version DATA
