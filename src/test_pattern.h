@@ -74,3 +74,22 @@ private:
     const std::uint32_t width_;
     const std::uint32_t height_;
 };
+
+// A media error: animated TV static (grey snow with a slow rolling bright band), redrawn about 15 times a second on
+// the staging thread. Each row is a random slice of a small pre-made noise tile, so a frame costs one row copy each.
+class NoiseSource : public FrameSource
+{
+public:
+    NoiseSource(std::uint32_t width, std::uint32_t height);
+
+    std::uint64_t copyLatest(std::uint64_t lastSeq, std::uint8_t* dst, std::uint32_t dstPitch) override;
+
+private:
+    static constexpr std::uint32_t kTileWidth = 512;
+    static constexpr std::uint32_t kTileRows = 64;
+    const std::uint32_t width_;
+    const std::uint32_t height_;
+    std::vector<std::uint32_t> tile_;     // kTileRows rows of 2 * kTileWidth pixels (doubled: a slice never wraps)
+    std::vector<std::uint32_t> bright_;   // the same rows, brighter: the rolling band
+    std::uint64_t seed_{ 0x9E3779B97F4A7C15ull };
+};

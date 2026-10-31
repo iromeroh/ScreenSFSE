@@ -21,6 +21,8 @@ constexpr std::uint32_t kChannels = 2;
 constexpr std::size_t kChunkBytes = 2400 * 4;   // 50 ms of 48 kHz stereo s16
 constexpr UINT32 kMaxQueued = 20;               // 1 s of sound queued at most: beyond that a chunk is dropped
 constexpr std::size_t kMaxBufferedBytes = 64u << 20;   // compressed stream kept ahead at most (the fetcher waits)
+// Nothing arrived: the stream failed. archive.org's AVIs take 18-22 s to start (index at the end of a large file).
+constexpr std::chrono::seconds kNoDataTimeout{ 45 };
 
 std::wstring widen(const std::string& text)
 {
@@ -85,7 +87,9 @@ void LivePlayer::fail(const std::string& message)
 {
     logger_.warn("Live: " + message);
     std::lock_guard lock(errorMutex_);
-    lastError_ = message;
+    if (!stalled_.load() || lastError_.empty()) {
+        lastError_ = message;   // after a stall, the decoder's "End of file" would hide the reason
+    }
 }
 
 std::string LivePlayer::lastError() const
@@ -94,10 +98,32 @@ std::string LivePlayer::lastError() const
     return lastError_;
 }
 
-bool LivePlayer::open(const std::string& videoUrl, const std::string& audioUrl)
+bool LivePlayer::open(const std::string& videoUrl, const std::string& audioUrl, double startAt, double duration,
+                      const std::string& headers)
 {
     url_ = videoUrl;
     audioUrl_ = audioUrl;
+    userAgent_.clear();
+    headers_.clear();
+    for (std::size_t at = 0; at < headers.size();) {
+        std::size_t end = headers.find("\r\n", at);
+        if (end == std::string::npos) {
+            end = headers.size();
+        }
+        const std::string line = headers.substr(at, end - at);
+        if (_strnicmp(line.c_str(), "User-Agent: ", 12) == 0) {
+            userAgent_ = line.substr(12);
+        } else if (!line.empty()) {
+            headers_ += line + "\r\n";
+        }
+        at = end + 2;
+    }
+    onDemand_ = startAt >= 0.0;
+    duration_ = onDemand_ ? (std::max)(duration, 0.0) : 0.0;
+    {
+        std::lock_guard lock(clockMutex_);
+        offset_ = onDemand_ ? startAt : 0.0;
+    }
     std::error_code ec;
     if (ffmpeg_.empty() || !std::filesystem::exists(ffmpeg_, ec)) {
         fail("ffmpeg.exe not found (live streams need it; see ScreenSFSE.ini)");
@@ -189,6 +215,7 @@ bool LivePlayer::start()
     quit_.store(false);
     userStopped_.store(false);
     ended_.store(false);
+    stalled_.store(false);
     {
         std::lock_guard lock(framesMutex_);
         for (auto& f : frames_) {
@@ -223,13 +250,35 @@ bool LivePlayer::start()
     }
     const int port = ntohs(addr.sin_port);
 
-    // 1. fetch: the live HLS as fast as it comes (no decoding, no -re) -> MPEG-TS -> our buffer
-    std::vector<std::wstring> fetchArgs = { L"-hide_banner", L"-loglevel", L"error", L"-nostdin", L"-i", widen(url_) };
+    // 1. fetch: the live HLS as fast as it comes (no decoding, no -re) -> MPEG-TS -> our buffer. On demand: from the
+    // position reached (-ss on each input), into NUT, which carries VP9, AV1 and Opus (MPEG-TS does not) and HLS's
+    // ADTS AAC (Matroska does not: "Error parsing AAC extradata").
+    const wchar_t* container = onDemand_ ? L"nut" : L"mpegts";
+    std::vector<std::wstring> seek;
+    if (onDemand_) {
+        std::lock_guard lock(clockMutex_);
+        if (offset_ > 0.5) {
+            seek = { L"-ss", std::to_wstring(offset_) };
+        }
+    }
+    // Each input gets the CDN's headers (yt-dlp's): without them some answer every HLS segment with 410 Gone, and
+    // ffmpeg's HLS reader skips the segments with warnings only, so nothing ever arrives.
+    std::vector<std::wstring> input = seek;
+    if (!userAgent_.empty()) {
+        input.insert(input.end(), { L"-user_agent", widen(userAgent_) });
+    }
+    if (!headers_.empty()) {
+        input.insert(input.end(), { L"-headers", widen(headers_) });
+    }
+    std::vector<std::wstring> fetchArgs = { L"-hide_banner", L"-loglevel", L"error", L"-nostdin" };
+    fetchArgs.insert(fetchArgs.end(), input.begin(), input.end());
+    fetchArgs.insert(fetchArgs.end(), { L"-i", widen(url_) });
     if (!audioUrl_.empty()) {
+        fetchArgs.insert(fetchArgs.end(), input.begin(), input.end());
         fetchArgs.insert(fetchArgs.end(), { L"-i", widen(audioUrl_) });
     }
     fetchArgs.insert(fetchArgs.end(), { L"-map", L"0:v:0", L"-map", audioUrl_.empty() ? L"0:a:0" : L"1:a:0", L"-c", L"copy",
-                                        L"-f", L"mpegts", L"pipe:1" });
+                                        L"-f", container, L"pipe:1" });
     void* fetchOut = nullptr;
     void* fetchErr = nullptr;
     fetchProcess_ = spawn(fetchArgs, nullptr, &fetchOut, &fetchErr);
@@ -240,7 +289,7 @@ bool LivePlayer::start()
     const std::wstring filter = L"scale=" + w + L":" + h + L":force_original_aspect_ratio=decrease,pad=" + w + L":" + h +
                                 L":(ow-iw)/2:(oh-ih)/2:color=black,fps=30,format=rgba";
     const std::vector<std::wstring> decodeArgs = {
-        L"-hide_banner", L"-loglevel", L"error", L"-re", L"-f", L"mpegts", L"-i", L"pipe:0",
+        L"-hide_banner", L"-loglevel", L"error", L"-re", L"-f", container, L"-i", L"pipe:0",
         L"-map", L"0:v:0", L"-vf", filter, L"-f", L"rawvideo", L"-pix_fmt", L"rgba", L"pipe:1",
         L"-map", L"0:a:0", L"-ac", L"2", L"-ar", L"48000", L"-f", L"s16le", L"tcp://127.0.0.1:" + std::to_wstring(port) };
     void* decodeIn = nullptr;
@@ -262,9 +311,11 @@ bool LivePlayer::start()
     {
         std::lock_guard lock(clockMutex_);
         started_ = std::chrono::steady_clock::now();
+        clockRunning_ = false;   // until the first frame
     }
-    logger_.info("Live stream started (ffmpeg fetch + decode, " + std::to_string(width_) + "x" + std::to_string(height_) +
-                 ", " + std::to_string(bufferSeconds_) + " s buffer, sound on port " + std::to_string(port) + ").");
+    logger_.info(std::string(onDemand_ ? "Stream started on demand" : "Live stream started") + " (ffmpeg fetch + decode, " +
+                 std::to_string(width_) + "x" + std::to_string(height_) + ", " + std::to_string(bufferTime()) +
+                 " s buffer, sound on port " + std::to_string(port) + ").");
     fetchThread_ = std::thread([this, fetchOut] { fetchLoop(fetchOut); });
     feedThread_ = std::thread([this, decodeIn] { feedLoop(decodeIn); });
     fetchErrorThread_ = std::thread([this, fetchErr] { errorLoop(fetchErr); });
@@ -310,10 +361,20 @@ void LivePlayer::feedLoop(void* pipe)
         const auto filled = [this] {
             return quit_.load() || fetchEnded_ ||
                    (firstByte_ != std::chrono::steady_clock::time_point{} &&
-                    std::chrono::steady_clock::now() - firstByte_ >= std::chrono::duration<double>(bufferSeconds_));
+                    std::chrono::steady_clock::now() - firstByte_ >= std::chrono::duration<double>(bufferTime()));
         };
+        const auto waitStart = std::chrono::steady_clock::now();
         while (!filled()) {
             ringCv_.wait_for(lock, std::chrono::milliseconds(100));
+            if (firstByte_ == std::chrono::steady_clock::time_point{} &&
+                std::chrono::steady_clock::now() - waitStart >= kNoDataTimeout) {
+                // e.g. a CDN refusing every HLS segment: ffmpeg only warns and keeps trying
+                stalled_.store(true);
+                lock.unlock();
+                fail("no data from the stream in " + std::to_string(kNoDataTimeout.count()) + " s");
+                CloseHandle(static_cast<HANDLE>(pipe));   // end of input: the decoder exits, finished() follows
+                return;
+            }
         }
         if (!quit_.load()) {
             logger_.info("Live buffer filled: " + std::to_string(ringBytes_ / 1024) + " KiB before playback.");
@@ -381,7 +442,7 @@ void LivePlayer::play()
     if (playing_.exchange(true)) {
         return;
     }
-    start();   // back to the live edge
+    start();   // back to the live edge; on demand, where it paused
 }
 
 void LivePlayer::pause()
@@ -413,14 +474,17 @@ bool LivePlayer::finished() const
 double LivePlayer::clock() const
 {
     std::lock_guard lock(clockMutex_);
+    if (!clockRunning_) {
+        return 0.0;
+    }
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - started_).count();
 }
 
 double LivePlayer::positionSeconds() const
 {
     std::lock_guard lock(clockMutex_);
-    if (!playing_.load()) {
-        return offset_;
+    if (!playing_.load() || !clockRunning_) {
+        return offset_;   // paused, or no picture yet (a slow site can take 20 s)
     }
     return offset_ + std::chrono::duration<double>(std::chrono::steady_clock::now() - started_).count();
 }
@@ -501,6 +565,7 @@ void LivePlayer::videoLoop(void* pipe)
         if (framesRead_ == 0) {
             std::lock_guard clockLock(clockMutex_);
             started_ = std::chrono::steady_clock::now();   // the run's clock starts with its first frame
+            clockRunning_ = true;
         }
         std::lock_guard lock(framesMutex_);
         frame.pts = static_cast<double>(framesRead_++) / kFps;

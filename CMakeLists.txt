@@ -23,6 +23,7 @@ set(COMMONLIB_SHARED_SOURCES
 
 set(COMMONLIB_RE_SOURCES
     ${COMMONLIB_ROOT}/src/RE/A/Array.cpp
+    ${COMMONLIB_ROOT}/src/RE/B/BSLock.cpp
     ${COMMONLIB_ROOT}/src/RE/O/Object.cpp
     ${COMMONLIB_ROOT}/src/RE/T/TypeInfo.cpp
     ${COMMONLIB_ROOT}/src/RE/V/Variable.cpp
@@ -41,6 +42,9 @@ set(PLUGIN_SOURCES
     src/media_player.cpp
     src/live_player.cpp
     src/screen_controller.cpp
+    src/screen_location.cpp
+    src/save_sync.cpp
+    src/subtitles.cpp
 )
 
 # d3d12_vtbl.cpp defines CINTERFACE before any Windows header, so it is the one source compiled without the
@@ -73,6 +77,7 @@ target_link_libraries(ScreenSFSEPlugin PRIVATE
     d3dcompiler
     dbghelp
     dxgi
+    gdi32
     mf
     mfplat
     mfplay

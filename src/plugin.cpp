@@ -144,8 +144,19 @@ void applyVideoKey(const std::string& key, const std::string& value, Logger& log
         if (bar == std::string::npos || bar == 0 || bar + 1 >= value.size()) {
             logger.warn("[Video] playlist needs Name|Source: '" + value + "'");
         } else {
-            v.playlists.push_back({ trimCopy(value.substr(0, bar)), trimCopy(value.substr(bar + 1)) });
+            std::string source = trimCopy(value.substr(bar + 1));
+            VideoConfig::PlaylistEntry entry;
+            splitPlaylistOptions(source, entry);   // |subs= |items= |stream
+            entry.name = trimCopy(value.substr(0, bar));
+            entry.source = std::move(source);
+            v.playlists.push_back(std::move(entry));
         }
+    } else if (key == "subtitle_languages") {
+        v.subtitleLanguages = splitLanguages(value);
+    } else if (key == "subtitle_size") {
+        v.subtitleSize = std::clamp(parseFloat(value, 1.0f), 0.5f, 2.5f);
+    } else if (key == "mute_game_music") {
+        v.muteGameMusic = parseBool(value);
     } else if (key == "volume_step") {
         v.volumeStep = std::clamp(parseFloat(value, 0.1f), 0.01f, 0.5f);
     } else if (key == "live_buffer_seconds") {
@@ -177,6 +188,7 @@ void applyIniConfig(Logger& logger)
 {
     const std::filesystem::path iniPath =
         std::filesystem::path("Data") / "SFSE" / "Plugins" / "ScreenSFSE.ini";
+    g_videoConfig.playlistIni = std::filesystem::absolute(iniPath);
 
     std::ifstream stream(iniPath);
     if (!stream.is_open()) {
@@ -249,7 +261,7 @@ extern "C" __declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface* sfse)
         std::vector<ScreenController::ChannelInfo> channels;
         for (const auto& c : kScreenChannels) {
             g_surfaceConfig.channels.push_back({ c.id, c.width, c.height });
-            channels.push_back({ c.id, c.key, c.width, c.height, c.id % 10 });
+            channels.push_back({ c.id, c.key, c.width, c.height, c.id % 10, c.soundRange });
         }
         if (!installVideoSurface(g_logger, g_surfaceConfig)) {
             g_logger.warn("Video surface hooks not (fully) installed; see the lines above.");

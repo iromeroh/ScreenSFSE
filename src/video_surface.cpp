@@ -21,10 +21,13 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -103,11 +106,23 @@ struct Channel
     bool osdDrawn{ false };      // the last upload carried the notice (one clean copy removes it)
 };
 
+// A ring slot: one upload buffer per channel (Channel::upload[slot]) and the command list that copies them into the
+// textures. The staging thread fills a free slot with the channels' new frames (Idle -> Staging -> Ready); the game's
+// submission hook records and submits the copies (Ready -> Idle, its fence pending until the GPU is done).
+enum class SlotState
+{
+    Idle,
+    Staging,
+    Ready
+};
+
 struct Slot
 {
     ID3D12CommandAllocator* allocator{ nullptr };
     ID3D12GraphicsCommandList* list{ nullptr };
     UINT64 fence{ 0 };
+    SlotState state{ SlotState::Idle };
+    std::vector<char> fresh;   // per channel: a new frame was staged in this slot
 };
 
 struct QueueStat
@@ -128,7 +143,8 @@ ID3D12Device* g_device = nullptr;
 ID3D12Fence* g_fence = nullptr;
 UINT64 g_fenceValue = 0;
 std::array<Slot, kRing> g_ring{};
-std::size_t g_ringNext = 0;
+std::size_t g_stageNext = 0;    // the slot the staging thread fills next
+std::size_t g_submitNext = 0;   // the slot the hook submits next (same order)
 bool g_uploadReady = false;
 bool g_uploadFailed = false;
 std::vector<Channel> g_channels;   // fixed at install; contents under g_mutex
@@ -136,12 +152,20 @@ std::vector<Channel> g_channels;   // fixed at install; contents under g_mutex
 std::array<QueueStat, 8> g_queues{};
 ID3D12CommandQueue* g_chosenQueue = nullptr;
 std::chrono::steady_clock::time_point g_queueWindowStart{};
-// Next upload due. Advanced by whole periods (not from the last upload) so the rate holds at fps even though uploads
-// can only happen on the game's submissions: in game, 'period since last' gave ~19 of 30 fps.
-std::chrono::steady_clock::time_point g_nextUpload{};
 std::chrono::steady_clock::time_point g_lastStats{};
 std::uint64_t g_statUploads = 0;
 std::uint64_t g_statBusy = 0;
+// Staging thread: copies the frames into the upload buffers at fps, off the game's threads (the copies, 3-4 MB per
+// playing channel, would stutter inside the game's ExecuteCommandLists with two screens
+// playing). It sleeps on g_stagerCv while no screen texture is live.
+std::thread g_stager;
+std::mutex g_stagerMutex;
+std::condition_variable g_stagerCv;
+std::atomic<std::uint64_t> g_statStageMicros{ 0 };      // time spent copying frames (staging thread)
+std::atomic<std::uint64_t> g_statStageMaxMicros{ 0 };
+std::atomic<std::uint64_t> g_statHookMaxMicros{ 0 };     // longest submission in the game's hook
+std::uint64_t g_statHookMicros = 0;                       // under g_mutex
+std::uint64_t g_statHookCalls = 0;
 
 std::string hex(std::uint64_t v)
 {
@@ -212,11 +236,29 @@ void maybeLogNearMiss(const char* api, const D3D12_RESOURCE_DESC& d)
     if (!g_cfg.logNearMisses || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
         return;
     }
+    // render targets, depth buffers and UAVs are never a placeholder texture: the game's 1280x800 targets used up
+    // the whole log budget before any screen loaded
+    constexpr auto kNotATexture = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (d.Flags & kNotATexture) {
+        return;
+    }
     const bool close = std::any_of(g_channels.begin(), g_channels.end(), [&d](const Channel& c) {
         return d.Width == c.width || d.Height == c.height;
     });
-    if (!close) {
+    // any single-mip RGBA8 texture looks like a placeholder: logged once per size, whatever the size (a placeholder
+    // may not appear at its own size)
+    const bool rgba = d.MipLevels == 1 && d.Format >= DXGI_FORMAT_R8G8B8A8_TYPELESS && d.Format <= DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    if (!close && !rgba) {
         return;
+    }
+    {
+        static std::mutex seenMutex;
+        static std::set<std::uint64_t> seen;
+        std::lock_guard lock(seenMutex);
+        if (!seen.insert(d.Width << 20 ^ d.Height << 4 ^ d.Format).second) {
+            return;
+        }
     }
     if (g_nearMissLogs.fetch_add(1) < kMaxNearMissLogs) {
         info(std::string("Near miss (") + api + "): " + describe(d));
@@ -263,6 +305,7 @@ void registerSurface(const char* api, void* object, REFIID riid, const D3D12_RES
     g_liveSurfaces.fetch_add(1);
     g_trackedSurfaces.fetch_add(1);
     ch.lastSeq = 0;   // a new texture needs the current frame even if it is not new
+    g_stagerCv.notify_all();
     info(std::string("Screen surface #") + std::to_string(s.id) + " (channel " + std::to_string(ch.id) + ") matched via " +
          api + ": " + describe(d) + " simultaneous=" + (simultaneous ? "yes" : "no") + extra + " resource=" + ptr(resource));
 }
@@ -653,28 +696,27 @@ void chooseQueue(ID3D12CommandQueue* queue, std::chrono::steady_clock::time_poin
     }
 }
 
+// The game's submission hook: retires released textures and submits a slot the staging thread has filled. No frame
+// copies here (3-4 MB per playing channel on the game's render thread stutters).
 void uploadFrame(ID3D12CommandQueue* queue)
 {
     std::unique_lock lock(g_mutex, std::try_to_lock);
     if (!lock.owns_lock()) {
         return;
     }
-    const auto now = std::chrono::steady_clock::now();
+    const auto start = std::chrono::steady_clock::now();
+    const auto now = start;
     chooseQueue(queue, now);
     if (queue != g_chosenQueue) {
         return;
     }
-    if (now - g_lastStats >= std::chrono::seconds(10)) {
-        if (g_statUploads || g_statBusy) {
-            info("Stats: " + std::to_string(g_statUploads) + " frame copies, " + std::to_string(g_statBusy) +
-                 " skipped (GPU busy), " + std::to_string(g_surfaces.size()) + " surface(s)");
-        }
-        g_statUploads = g_statBusy = 0;
-        g_lastStats = now;
-    }
-    if (now < g_nextUpload) {
+    // The hook runs on every game submission (~800/s): the bookkeeping below only when a slot is ready to go, or every
+    // 100 ms (textures the game released while nothing new was staged, e.g. paused, are still let go).
+    static std::chrono::steady_clock::time_point nextHousekeeping{};
+    if (g_ring[g_submitNext].state != SlotState::Ready && now < nextHousekeeping) {
         return;
     }
+    nextHousekeeping = now + std::chrono::milliseconds(100);
     if (!ensureUploadObjects()) {
         return;
     }
@@ -683,101 +725,219 @@ void uploadFrame(ID3D12CommandQueue* queue)
     if (g_liveSurfaces.load() == 0) {
         return;
     }
-    const std::size_t slotIndex = g_ringNext;
+    // upload buffers for channels whose first texture appeared (the staging thread only fills ready channels)
+    for (const auto& s : g_surfaces) {
+        if (!s.released) {
+            ensureChannelUpload(g_channels[s.channel], s.desc);
+        }
+    }
+    const std::size_t slotIndex = g_submitNext;
     Slot& slot = g_ring[slotIndex];
-    if (completed < slot.fence) {
-        ++g_statBusy;
+    if (slot.state != SlotState::Ready) {
         return;
     }
     if (FAILED(slot.allocator->Reset()) || FAILED(slot.list->Reset(slot.allocator, nullptr))) {
         return;
     }
-    std::vector<bool> copied(g_channels.size(), false);
     int copies = 0;
-    for (std::size_t c = 0; c < g_channels.size(); ++c) {
-        Channel& ch = g_channels[c];
-        if (ch.live == 0 || !ch.source) {
+    for (auto& s : g_surfaces) {
+        if (s.released || !slot.fresh[s.channel]) {
             continue;
         }
-        const Surface* first = nullptr;
-        for (const auto& s : g_surfaces) {
-            if (!s.released && s.channel == c) {
-                first = &s;
-                break;
-            }
+        const Channel& ch = g_channels[s.channel];
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = s.resource;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        if (!s.simultaneous) {
+            barrier.Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(g_cfg.assumedState);
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            slot.list->ResourceBarrier(1, &barrier);
         }
-        if (!first || !ensureChannelUpload(ch, first->desc)) {
-            continue;
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = s.resource;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = ch.upload[slotIndex];
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint = ch.footprint;
+        src.PlacedFootprint.Footprint.Format = s.desc.Format;
+        slot.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        if (!s.simultaneous) {
+            std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+            slot.list->ResourceBarrier(1, &barrier);
         }
-        // While a notice shows (and once after, to clear it) the current frame is copied every tick, even when it
-        // has not changed (paused, stopped): the notice is drawn over a fresh copy.
-        const bool osdOn = ch.osd.until > now;
-        std::uint8_t* frame = ch.mapped[slotIndex] + ch.footprint.Offset;
-        const std::uint64_t seq = ch.source->copyLatest(osdOn || ch.osdDrawn ? 0 : ch.lastSeq, frame,
-                                                        ch.footprint.Footprint.RowPitch);
-        if (seq == 0) {
-            continue;
-        }
-        if (osdOn) {
-            drawOsd(frame, ch.footprint.Footprint.RowPitch, ch.width, ch.height, ch.osd);
-        }
-        ch.osdDrawn = osdOn;
-        ch.lastSeq = seq;
-        copied[c] = true;
-        for (auto& s : g_surfaces) {
-            if (s.released || s.channel != c) {
-                continue;
-            }
-            D3D12_RESOURCE_BARRIER barrier{};
-            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            barrier.Transition.pResource = s.resource;
-            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            if (!s.simultaneous) {
-                barrier.Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(g_cfg.assumedState);
-                barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-                slot.list->ResourceBarrier(1, &barrier);
-            }
-            D3D12_TEXTURE_COPY_LOCATION dst{};
-            dst.pResource = s.resource;
-            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            dst.SubresourceIndex = 0;
-            D3D12_TEXTURE_COPY_LOCATION src{};
-            src.pResource = ch.upload[slotIndex];
-            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            src.PlacedFootprint = ch.footprint;
-            src.PlacedFootprint.Footprint.Format = s.desc.Format;
-            slot.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-            if (!s.simultaneous) {
-                std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
-                slot.list->ResourceBarrier(1, &barrier);
-            }
-            ++copies;
+        s.lastFence = g_fenceValue + 1;
+        ++copies;
+    }
+    if (FAILED(slot.list->Close())) {
+        return;
+    }
+    if (copies > 0) {
+        ID3D12CommandList* lists[] = { slot.list };
+        g_executeCommandLists(queue, 1, lists);
+        queue->Signal(g_fence, ++g_fenceValue);
+        slot.fence = g_fenceValue;
+        g_statUploads += static_cast<std::uint64_t>(copies);
+        static bool firstLogged = false;
+        if (!firstLogged) {
+            firstLogged = true;
+            info("First frame uploaded on queue " + ptr(queue) + " (frames staged on ScreenSFSE's own thread).");
         }
     }
-    if (FAILED(slot.list->Close()) || copies == 0) {
-        return;   // nothing new on any channel: the slot stays free for the next tick
+    std::fill(slot.fresh.begin(), slot.fresh.end(), 0);
+    slot.state = SlotState::Idle;
+    g_submitNext = (g_submitNext + 1) % kRing;
+    const auto micros = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+    g_statHookMicros += micros;
+    ++g_statHookCalls;
+    if (micros > g_statHookMaxMicros.load()) {
+        g_statHookMaxMicros.store(micros);
     }
+}
+
+// Every 10 s while frames flow, from the staging thread (no file writes in the game's hook).
+void logStats()
+{
+    std::string line;
+    {
+        std::lock_guard lock(g_mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - g_lastStats < std::chrono::seconds(10)) {
+            return;
+        }
+        g_lastStats = now;
+        if (g_statUploads || g_statBusy) {
+            const std::uint64_t frames = g_statUploads ? g_statUploads : 1;
+            const std::uint64_t calls = g_statHookCalls ? g_statHookCalls : 1;
+            line = "Stats: " + std::to_string(g_statUploads) + " frame copies, " + std::to_string(g_statBusy) +
+                   " skipped (GPU busy), " + std::to_string(g_surfaces.size()) + " surface(s); staging thread " +
+                   std::to_string(g_statStageMicros.exchange(0) / frames) + " us per copy (max " +
+                   std::to_string(g_statStageMaxMicros.exchange(0)) + "), game hook " +
+                   std::to_string(g_statHookMicros / calls) + " us per submission (max " +
+                   std::to_string(g_statHookMaxMicros.exchange(0)) + ")";
+        }
+        g_statUploads = g_statBusy = g_statHookMicros = g_statHookCalls = 0;
+    }
+    if (!line.empty()) {
+        info(line);
+    }
+}
+
+// One frame of one channel to stage: what the staging thread needs without holding g_mutex.
+struct StageJob
+{
+    std::size_t channel{ 0 };
+    std::shared_ptr<FrameSource> source;
+    std::uint8_t* dst{ nullptr };
+    std::uint32_t pitch{ 0 };
+    std::uint32_t width{ 0 };
+    std::uint32_t height{ 0 };
+    std::uint64_t lastSeq{ 0 };
+    bool osdOn{ false };
+    Osd osd;
+    std::uint64_t seq{ 0 };
+};
+
+// The staging thread: at fps, fills the next free ring slot with every live channel's new frame (and its notice).
+// Sleeps while no screen texture is live. Slots are filled and submitted in the same order; a slot is reused only
+// once the hook has submitted it and the GPU has finished with it (its fence).
+void stagerLoop()
+{
     const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<double>(1.0 / g_cfg.fps));
-    g_nextUpload += period;
-    if (g_nextUpload <= now - period) {   // first upload, or after a pause: restart the schedule
-        g_nextUpload = now + period;
-    }
-    ID3D12CommandList* lists[] = { slot.list };
-    g_executeCommandLists(queue, 1, lists);
-    queue->Signal(g_fence, ++g_fenceValue);
-    slot.fence = g_fenceValue;
-    for (auto& s : g_surfaces) {
-        if (!s.released && copied[s.channel]) {
-            s.lastFence = g_fenceValue;
+    auto next = std::chrono::steady_clock::now();
+    std::vector<StageJob> jobs;
+    for (;;) {
+        if (g_liveSurfaces.load() == 0) {
+            // the notify comes from the texture hook without this mutex: the timeout covers a missed one
+            std::unique_lock wait(g_stagerMutex);
+            g_stagerCv.wait_for(wait, std::chrono::seconds(1), [] { return g_liveSurfaces.load() > 0; });
+            next = std::chrono::steady_clock::now();
+            continue;
         }
-    }
-    g_ringNext = (g_ringNext + 1) % kRing;
-    g_statUploads += static_cast<std::uint64_t>(copies);
-    static bool firstLogged = false;
-    if (!firstLogged) {
-        firstLogged = true;
-        info("First frame uploaded on queue " + ptr(queue) + ".");
+        // whole periods (not from the last frame), so the rate holds at fps
+        next += period;
+        const auto now = std::chrono::steady_clock::now();
+        if (next <= now - period) {
+            next = now + period;
+        }
+        std::this_thread::sleep_until(next);
+
+        std::size_t slotIndex = 0;
+        jobs.clear();
+        {
+            std::lock_guard lock(g_mutex);
+            if (!g_uploadReady || !g_fence) {
+                continue;
+            }
+            slotIndex = g_stageNext;
+            Slot& slot = g_ring[slotIndex];
+            if (slot.state != SlotState::Idle || g_fence->GetCompletedValue() < slot.fence) {
+                ++g_statBusy;   // the hook has not submitted it yet, or the GPU still reads it
+                continue;
+            }
+            slot.state = SlotState::Staging;
+            if (slot.fresh.size() != g_channels.size()) {
+                slot.fresh.assign(g_channels.size(), 0);
+            }
+            const auto stamp = std::chrono::steady_clock::now();
+            for (std::size_t c = 0; c < g_channels.size(); ++c) {
+                Channel& ch = g_channels[c];
+                if (ch.live == 0 || !ch.source || !ch.ready) {
+                    continue;
+                }
+                StageJob job;
+                job.channel = c;
+                job.source = ch.source;
+                job.dst = ch.mapped[slotIndex] + ch.footprint.Offset;
+                job.pitch = ch.footprint.Footprint.RowPitch;
+                job.width = ch.width;
+                job.height = ch.height;
+                // while a notice shows (and once after, to clear it) the current frame is copied every tick, even when
+                // it has not changed (paused, stopped): the notice is drawn over a fresh copy
+                job.osdOn = ch.osd.until > stamp;
+                job.osd = ch.osd;
+                job.lastSeq = job.osdOn || ch.osdDrawn ? 0 : ch.lastSeq;
+                jobs.push_back(std::move(job));
+            }
+        }
+        const auto begin = std::chrono::steady_clock::now();
+        for (auto& job : jobs) {
+            job.seq = job.source->copyLatest(job.lastSeq, job.dst, job.pitch);
+            if (job.seq != 0 && job.osdOn) {
+                drawOsd(job.dst, job.pitch, job.width, job.height, job.osd);
+            }
+        }
+        const auto micros = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count());
+        bool any = false;
+        {
+            std::lock_guard lock(g_mutex);
+            Slot& slot = g_ring[slotIndex];
+            for (auto& job : jobs) {
+                Channel& ch = g_channels[job.channel];
+                if (job.seq == 0 || ch.source != job.source) {
+                    continue;   // nothing new, or the source was replaced meanwhile (its first frame comes next tick)
+                }
+                ch.lastSeq = job.seq;
+                ch.osdDrawn = job.osdOn;
+                slot.fresh[job.channel] = 1;
+                any = true;
+            }
+            slot.state = any ? SlotState::Ready : SlotState::Idle;
+            if (any) {
+                g_stageNext = (g_stageNext + 1) % kRing;
+                g_statStageMicros.fetch_add(micros);
+                if (micros > g_statStageMaxMicros.load()) {
+                    g_statStageMaxMicros.store(micros);
+                }
+            }
+        }
+        jobs.clear();   // a replaced source may be released here, on this thread (its destructor joins its threads)
+        logStats();
     }
 }
 
@@ -889,6 +1049,10 @@ bool installVideoSurface(Logger& logger, const SurfaceConfig& config)
     }
     info("Video surface armed: channels " + list + " @ " + std::to_string(g_cfg.fps) + " fps, simultaneous=" +
          (g_cfg.simultaneousAccess ? "on" : "off") + ", assumedState=" + hex(g_cfg.assumedState));
+    if (!g_stager.joinable()) {
+        g_stager = std::thread(stagerLoop);   // lives as long as the game; sleeps while no screen texture is live
+        g_stager.detach();
+    }
     return ok;
 }
 

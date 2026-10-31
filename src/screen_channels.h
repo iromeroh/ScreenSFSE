@@ -9,15 +9,24 @@ struct ScreenChannelDef
     const char* key;
     std::uint32_t width;
     std::uint32_t height;
+    float soundRange;   // x full_volume_meters / silent_meters
 };
 
 inline constexpr ScreenChannelDef kScreenChannels[] = {
-    { 1, "wall1", 1008, 724 },
-    { 2, "wall2", 1008, 726 },
-    { 3, "wall3", 1008, 728 },
-    { 4, "wall4", 1008, 730 },
-    { 11, "tv1", 1280, 640 },
-    { 12, "tv2", 1280, 642 },
-    { 13, "tv3", 1280, 644 },
-    { 14, "tv4", 1280, 646 },
+    { 1, "wall1", 1008, 724, 1.0f },
+    { 2, "wall2", 1008, 726, 1.0f },
+    { 3, "wall3", 1008, 728, 1.0f },
+    { 4, "wall4", 1008, 730, 1.0f },
+    { 11, "tv1", 1280, 640, 1.0f },
+    { 12, "tv2", 1280, 642, 1.0f },
+    { 13, "tv3", 1280, 644, 1.0f },
+    { 14, "tv4", 1280, 646, 1.0f },
+    { 21, "small1", 800, 480, 1.0f },
+    { 22, "small2", 800, 482, 1.0f },
+    { 23, "small3", 800, 484, 1.0f },
+    { 24, "small4", 800, 486, 1.0f },
+    { 31, "billboard1", 1440, 720, 2.0f },
+    { 32, "billboard2", 1440, 722, 2.0f },
+    { 33, "billboard3", 1440, 724, 2.0f },
+    { 34, "billboard4", 1440, 726, 2.0f },
 };

@@ -201,3 +201,48 @@ std::uint64_t BlackSource::copyLatest(std::uint64_t lastSeq, std::uint8_t* dst, 
     }
     return 1;
 }
+
+NoiseSource::NoiseSource(std::uint32_t width, std::uint32_t height) :
+    width_(width), height_(height), tile_(std::size_t{ kTileRows } * kTileWidth * 2), bright_(tile_.size())
+{
+    std::uint64_t x = seed_;
+    for (std::size_t i = 0; i < std::size_t{ kTileRows } * kTileWidth; ++i) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        const std::uint32_t v = static_cast<std::uint32_t>(x >> 56);   // 0-255
+        const std::uint32_t grey = 20 + v * 150 / 255;
+        const std::uint32_t lit = std::min<std::uint32_t>(255, grey + 45);
+        const std::size_t row = i / kTileWidth, col = i % kTileWidth;
+        for (std::size_t copy : { col, col + kTileWidth }) {
+            tile_[row * kTileWidth * 2 + copy] = rgba(grey, grey, grey);
+            bright_[row * kTileWidth * 2 + copy] = rgba(lit, lit, lit);
+        }
+    }
+}
+
+std::uint64_t NoiseSource::copyLatest(std::uint64_t lastSeq, std::uint8_t* dst, std::uint32_t dstPitch)
+{
+    using namespace std::chrono;
+    const std::uint64_t frame = static_cast<std::uint64_t>(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count() / 66);
+    const std::uint64_t seq = frame + 1;
+    if (seq == lastSeq) {
+        return 0;
+    }
+    const std::uint32_t band = std::max<std::uint32_t>(1, height_ / 10);
+    const std::uint32_t bandTop = static_cast<std::uint32_t>(frame * 3 % (height_ + band));   // rolls down in ~5 s
+    for (std::uint32_t y = 0; y < height_; ++y) {
+        seed_ ^= seed_ << 13;
+        seed_ ^= seed_ >> 7;
+        seed_ ^= seed_ << 17;
+        const std::size_t row = static_cast<std::size_t>(seed_ % kTileRows);
+        const std::size_t offset = static_cast<std::size_t>((seed_ >> 20) % kTileWidth);
+        const bool lit = y + band >= bandTop && y < bandTop;
+        const std::uint32_t* src = (lit ? bright_ : tile_).data() + row * kTileWidth * 2 + offset;
+        auto* out = reinterpret_cast<std::uint32_t*>(dst + std::size_t{ y } * dstPitch);
+        for (std::uint32_t x = 0; x < width_; x += kTileWidth) {
+            std::memcpy(out + x, src, std::min(kTileWidth, width_ - x) * sizeof(std::uint32_t));
+        }
+    }
+    return seq;
+}

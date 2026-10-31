@@ -99,6 +99,15 @@ private:
     static bool nativeSetMessageName(std::monostate, RE::BGSMessage* message, std::string name);
     static bool nativeScreenUnloaded(std::monostate, RE::TESObjectREFR* screenRef);
     static bool nativeScreenRemoved(std::monostate, RE::TESObjectREFR* screenRef);
+    static bool nativeMusicMuteWanted(std::monostate, float playerX, float playerY, float playerZ);
+    static float nativeSoundSourceRange(std::monostate, RE::TESObjectREFR* screenRef);
+    static bool nativeLog(std::monostate, std::string text);
+    static std::int32_t nativeRemoteScreens(std::monostate, float playerX, float playerY, float playerZ);
+    static std::int32_t nativeRemoteScreenId(std::monostate, std::int32_t index);
+    static std::string nativeRemoteScreenLabel(std::monostate, std::int32_t index);
+    static std::string nativeRemoteLabel(std::monostate, std::int32_t screenId, float playerX, float playerY, float playerZ);
+    static std::string nativeRemoteField(std::monostate, std::int32_t screenId, std::int32_t field);
+    static std::string nativeRemoteAction(std::monostate, std::int32_t screenId, std::int32_t action);
 
     Logger& logger_;
     ScreenManager& screenManager_;

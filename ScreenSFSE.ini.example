@@ -23,9 +23,19 @@ LogNearMisses=true
 [Video]
 Enabled=true
 ; Playlists, in menu order ("Next Playlist" cycles through them), like the radio's stations: playlist=Name|Source
-; Source: a YouTube playlist or video URL (each video is downloaded once with yt-dlp into <root>\Cache as an H.264
-; MP4; the next one is prefetched), or a folder / video file (absolute, or relative to the root folder).
-; A "My Videos" playlist for <root>\Videos is always added at the end.
+; Source: a web address - YouTube or many other video sites (any site yt-dlp supports), a page with videos, or a
+; direct stream link (.m3u8, .mp4) - or a folder / video file (absolute, or relative to the root folder). Online
+; videos are downloaded once with yt-dlp into <root>\Cache as H.264 MP4s (the next one is prefetched); a site that
+; offers no H.264 MP4 is streamed instead. Live streams are always streamed.
+; "My Videos" contains direct files in <root>\Videos. Subfolders become "Local: Folder" playlists.
+; Use the screen's second activation, Playlists / Subtitles > Refresh Playlists, after changing playlist= lines or
+; local folders/files.
+; Refresh validates playlist definitions first; other settings below still require a game restart.
+; Optional per playlist: |subs=en,es (its own subtitle languages) or |subs=off (no subtitles unless chosen in the menu),
+; e.g. playlist=Cartoons|https://www.youtube.com/playlist?list=...|subs=en
+; |stream: never download, always stream (starts in seconds; for long videos, links that expire, or videos you don't
+; want cached; streamed videos have no subtitles). |items=1,3-5: only those videos of a page or playlist.
+; e.g. playlist=Archive|https://archive.org/details/BigBuckBunny_124|stream
 playlist=Vangelis|https://www.youtube.com/watch?v=f2Bp-xkMc20
 ; Root folder for videos (Videos), the YouTube cache (Cache), tools (Tools) and the saved sessions. Empty: Data\VideoScreen
 ; in the game folder (like the radio's Data\Radio). A relative path is relative to the game folder.
@@ -34,15 +44,26 @@ root_path=
 ytdlp_path=
 ffmpeg_path=
 deno_path=
-; Highest YouTube video height downloaded (H.264).
+; Highest video height downloaded or streamed.
 max_height=720
 ; Sound: starting volume (0-1; the menu's Volume +/- is remembered), step of Volume +/-, and the distance fade:
-; full volume within full_volume_meters of the screen, silent from silent_meters.
+; full volume within full_volume_meters of the screen, silent from silent_meters. Video Billboards use twice both
+; distances (config/screen.json "sound_range"), so 4 m / 50 m with these values.
 volume=0.8
 volume_step=0.1
 full_volume_meters=2
 silent_meters=25
+; Silence the game's music (location/exploration music) while a screen plays or loads within silent_meters, as STAR
+; Radio's Mute Location Music. Paused or stopped screens give the music back.
+mute_game_music=true
 ; Back / Forward jump, in seconds.
 seek_seconds=30
-; YouTube live streams: seconds of stream kept ahead (covers network hiccups; the live picture is that much later).
+; Subtitles, in order of preference (e.g. es,en). For YouTube videos: the uploader's subtitles in these languages, else
+; YouTube's automatic captions when the video is spoken in one of them (never machine translations). For local videos:
+; Show.es.srt / Show.en.vtt next to Show.mp4. An untagged Show.srt always shows, even when this is empty.
+; The screen's second activation, Playlists / Subtitles > Subtitles, switches between the video's subtitles and off.
+subtitle_languages=
+; Subtitle letter size: 1 = 6% of the screen height (0.5-2.5).
+subtitle_size=1
+; Live streams: seconds of stream kept ahead (covers network hiccups; the live picture is that much later).
 live_buffer_seconds=5

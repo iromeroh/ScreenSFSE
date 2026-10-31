@@ -1,10 +1,11 @@
-# Building ScreenSFSE 0.1
+# Building ScreenSFSE 0.3.2
 
 ## Native plugin
 
 Requirements: Windows x64, Visual Studio 2022 with Desktop development with C++,
 a Windows SDK with Direct3D 12 and Media Foundation headers, and CMake 3.21 or
-later, plus Git. The project uses C++23 and targets Starfield 1.15.222.
+later, plus Git. The project uses C++23 and uses the
+Address Library, so it is not tied to one game version (developed on Starfield 1.16.244).
 
 Download CommonLibSF and commonlib-shared from their upstream repositories using
 the exact revisions used by this release. Run these commands from the repository
@@ -35,7 +36,7 @@ See THIRD_PARTY_NOTICES.txt for dependency versions and licenses.
 ## Install the DLL
 
 With the game closed, copy `build-vs/Release/ScreenSFSE.dll` to
-`Starfield/Data/SFSE/Plugins/ScreenSFSE.dll`. Use it with the published version 0.1
+`Starfield/Data/SFSE/Plugins/ScreenSFSE.dll`. Use it with the published version 0.3.2
 ESM, textures, models, and scripts. `ScreenSFSE.ini.example` is the default
 configuration; preserve existing user settings when replacing an installation.
 

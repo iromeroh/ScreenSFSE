@@ -2,6 +2,7 @@
 
 #include "papyrus_bridge.h"
 
+#include "save_sync.h"
 #include "screen_controller.h"
 
 #include "RE/A/Array.h"
@@ -56,6 +57,9 @@ void PapyrusBridge::onSFSEMessage(SFSEMessagingInterface::Message* message)
 
     instance_->logger_.info(std::string("SFSE message received: ") + messageTypeName(message->type));
     (void)instance_->tryRegisterNatives(messageTypeName(message->type));
+    if (message->type == SFSEMessagingInterface::kMessage_PostDataLoad && controller_) {
+        SaveSync::install(instance_->logger_, *controller_);   // the save token GLOB exists once the data is loaded
+    }
 }
 
 const char* PapyrusBridge::messageTypeName(const std::uint32_t type)
@@ -153,6 +157,15 @@ bool PapyrusBridge::tryRegisterNatives(const char* reason)
     vm->BindNativeMethod(kScriptName, "setMessageName", &PapyrusBridge::nativeSetMessageName, std::nullopt, false);
     vm->BindNativeMethod(kScriptName, "screenUnloaded", &PapyrusBridge::nativeScreenUnloaded, std::nullopt, false);
     vm->BindNativeMethod(kScriptName, "screenRemoved", &PapyrusBridge::nativeScreenRemoved, std::nullopt, false);
+    vm->BindNativeMethod(kScriptName, "musicMuteWanted", &PapyrusBridge::nativeMusicMuteWanted, std::nullopt, false);
+    vm->BindNativeMethod(kScriptName, "soundSourceRange", &PapyrusBridge::nativeSoundSourceRange, std::nullopt, false);
+    vm->BindNativeMethod(kScriptName, "log", &PapyrusBridge::nativeLog, std::nullopt, false);
+    vm->BindNativeMethod(kScriptName, "remoteScreens", &PapyrusBridge::nativeRemoteScreens, std::nullopt, false);
+    vm->BindNativeMethod(kScriptName, "remoteScreenId", &PapyrusBridge::nativeRemoteScreenId, std::nullopt, false);
+    vm->BindNativeMethod(kScriptName, "remoteScreenLabel", &PapyrusBridge::nativeRemoteScreenLabel, std::nullopt, false);
+    vm->BindNativeMethod(kScriptName, "remoteLabel", &PapyrusBridge::nativeRemoteLabel, std::nullopt, false);
+    vm->BindNativeMethod(kScriptName, "remoteField", &PapyrusBridge::nativeRemoteField, std::nullopt, false);
+    vm->BindNativeMethod(kScriptName, "remoteAction", &PapyrusBridge::nativeRemoteAction, std::nullopt, false);
 
     registered_ = true;
     logger_.info(std::string("Papyrus natives registered (script=") + kScriptName +
@@ -324,7 +337,8 @@ bool PapyrusBridge::nativeRegisterScreen(std::monostate, RE::TESObjectREFR* scre
     if (!controller_ || !screenRef) {
         return false;
     }
-    controller_->registerScreen(screenRef->GetFormID(), channel, x, y, z, playerX, playerY, playerZ);
+    controller_->registerScreen(screenRef->GetFormID(), channel, x, y, z, playerX, playerY, playerZ,
+                                ScreenLocation::reference(screenRef));
     return true;
 }
 
@@ -382,4 +396,57 @@ bool PapyrusBridge::nativeScreenRemoved(std::monostate, RE::TESObjectREFR* scree
         controller_->removed(screenRef->GetFormID());
     }
     return controller_ != nullptr;
+}
+
+bool PapyrusBridge::nativeMusicMuteWanted(std::monostate, float playerX, float playerY, float playerZ)
+{
+    return controller_ && controller_->musicMuteWanted(playerX, playerY, playerZ);
+}
+
+float PapyrusBridge::nativeSoundSourceRange(std::monostate, RE::TESObjectREFR* screenRef)
+{
+    return controller_ && screenRef ? controller_->soundSourceRange(screenRef->GetFormID()) : 0.0f;
+}
+
+// The Video Screen Remote. Screen IDs travel through Papyrus as Int (the form ID's bits).
+std::int32_t PapyrusBridge::nativeRemoteScreens(std::monostate, float playerX, float playerY, float playerZ)
+{
+    return controller_ ? controller_->remoteScreens(playerX, playerY, playerZ) : 0;
+}
+
+std::int32_t PapyrusBridge::nativeRemoteScreenId(std::monostate, std::int32_t index)
+{
+    return controller_ ? static_cast<std::int32_t>(controller_->remoteScreenId(index)) : 0;
+}
+
+std::string PapyrusBridge::nativeRemoteScreenLabel(std::monostate, std::int32_t index)
+{
+    return controller_ ? controller_->remoteScreenLabel(index) : std::string();
+}
+
+std::string PapyrusBridge::nativeRemoteLabel(std::monostate, std::int32_t screenId, float playerX, float playerY, float playerZ)
+{
+    return controller_ ? controller_->remoteLabel(static_cast<std::uint32_t>(screenId), playerX, playerY, playerZ) : std::string();
+}
+
+std::string PapyrusBridge::nativeRemoteField(std::monostate, std::int32_t screenId, std::int32_t field)
+{
+    return controller_ ? controller_->remoteField(static_cast<std::uint32_t>(screenId), field) : std::string();
+}
+
+std::string PapyrusBridge::nativeRemoteAction(std::monostate, std::int32_t screenId, std::int32_t action)
+{
+    if (!controller_) {
+        return "Video Screen: ScreenSFSE video is disabled";
+    }
+    return controller_->remoteAction(static_cast<std::uint32_t>(screenId), action);
+}
+
+// Script diagnostics into ScreenSFSE.log: Debug.Trace only reaches the Papyrus log when tracing is enabled in the INI.
+bool PapyrusBridge::nativeLog(std::monostate, std::string text)
+{
+    if (instance_) {
+        instance_->logger_.info("[script] " + text);
+    }
+    return instance_ != nullptr;
 }

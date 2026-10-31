@@ -21,4 +21,6 @@ public:
     // Output gains for the left and right speakers (0..1), e.g. from distance and direction.
     virtual void setGains(float left, float right) = 0;
     virtual bool live() const { return false; }
+    // Nothing ever arrived (a stream that stalled before its first data): a failure to start, however long it took.
+    virtual bool stalled() const { return false; }
 };
