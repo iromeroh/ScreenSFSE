@@ -8,7 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(COMMONLIB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/external/commonlibsf" CACHE PATH "CommonLibSF source directory")
 if(NOT EXISTS "${COMMONLIB_ROOT}/include/RE/Starfield.h")
-    message(FATAL_ERROR "CommonLibSF is missing. Follow the dependency instructions in BUILDING.md.")
+    message(FATAL_ERROR "CommonLibSF is missing. Follow BUILDING.md.")
 endif()
 
 set(COMMONLIB_SHARED_SOURCES
@@ -45,6 +45,7 @@ set(PLUGIN_SOURCES
     src/screen_location.cpp
     src/save_sync.cpp
     src/subtitles.cpp
+    src/slideshow_player.cpp
 )
 
 # d3d12_vtbl.cpp defines CINTERFACE before any Windows header, so it is the one source compiled without the
@@ -87,6 +88,7 @@ target_link_libraries(ScreenSFSEPlugin PRIVATE
     shell32
     strmiids
     version
+    windowscodecs
     wininet
     winmm
     ws2_32
@@ -108,3 +110,4 @@ endif()
 set_target_properties(ScreenSFSEPlugin PROPERTIES
     OUTPUT_NAME "ScreenSFSE"
 )
+

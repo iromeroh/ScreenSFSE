@@ -1,4 +1,5 @@
 #include "test_pattern.h"
+#include "osd.h"
 
 #include <algorithm>
 #include <chrono>
@@ -202,8 +203,9 @@ std::uint64_t BlackSource::copyLatest(std::uint64_t lastSeq, std::uint8_t* dst, 
     return 1;
 }
 
-NoiseSource::NoiseSource(std::uint32_t width, std::uint32_t height) :
-    width_(width), height_(height), tile_(std::size_t{ kTileRows } * kTileWidth * 2), bright_(tile_.size())
+NoiseSource::NoiseSource(std::uint32_t width, std::uint32_t height, std::string label, std::vector<std::string> lines) :
+    width_(width), height_(height), tile_(std::size_t{ kTileRows } * kTileWidth * 2), bright_(tile_.size()),
+    label_(std::move(label)), lines_(std::move(lines))
 {
     std::uint64_t x = seed_;
     for (std::size_t i = 0; i < std::size_t{ kTileRows } * kTileWidth; ++i) {
@@ -243,6 +245,9 @@ std::uint64_t NoiseSource::copyLatest(std::uint64_t lastSeq, std::uint8_t* dst, 
         for (std::uint32_t x = 0; x < width_; x += kTileWidth) {
             std::memcpy(out + x, src, std::min(kTileWidth, width_ - x) * sizeof(std::uint32_t));
         }
+    }
+    if (!label_.empty()) {
+        drawBanner(dst, dstPitch, width_, height_, label_, lines_);
     }
     return seq;
 }

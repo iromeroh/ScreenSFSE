@@ -26,10 +26,10 @@ struct IXAudio2SourceVoice;
 //              30 fps, raw RGBA on stdout; sound: 48 kHz stereo s16 PCM to a localhost TCP socket we listen on
 //              (Windows pipes cannot carry a second output).
 // The buffer keeps ~bufferSeconds of compressed stream ahead (MBs, not decoded frames), so network or HLS segment
-// stalls up to that long are not seen or heard (with -re straight on the HLS, a late segment froze picture and sound). Frames are shown in arrival order at 30 fps from a small buffer (live delivery is bursty and a
+// stalls up to that long are not seen or heard (in-game 2026-10-14 with -re straight on the HLS: a ~1.4 s freeze). Frames are shown in arrival order at 30 fps from a small buffer (live delivery is bursty and a
 // little under 30 fps: scheduling by timestamp dropped a third of them); a growing buffer is trimmed. No seek, no length.
 // pause() stops ffmpeg; play() starts again at the live edge. The stream ending or failing (ffmpeg exits) =
-// finished(), with ffmpeg's last error line in lastError().
+// finished(), with ffmpeg's last error line in lastError(). Tested by hand 2026-10-14 on a YouTube live: 30 fps, sound.
 // On demand (open with startAt >= 0): a video from a site whose files Media Foundation cannot play (WebM/VP9, AVI,
 // HLS). NUT between the stages; it starts at startAt, and play() after pause() goes on from where it paused
 // (-ss), so it keeps a position and resumes like a file. A seek is a new open at the new position.

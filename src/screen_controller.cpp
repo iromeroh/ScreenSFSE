@@ -4,6 +4,7 @@
 #include "logger.h"
 #include "media_player.h"
 #include "osd.h"
+#include "slideshow_player.h"
 #include "subtitles.h"
 #include "test_pattern.h"
 #include "video_fetcher.h"
@@ -30,7 +31,7 @@
 namespace
 {
 // World positions are in metres (RadioSFSE fades over 45 game units = metres). Not the NIF/.mesh scale (0.0142875):
-// using that made 20 m read as 0.3 m, so the sound never faded.
+// using that made 20 m read as 0.3 m, so the sound never faded (user, 2026-10-14).
 constexpr float kMetersPerUnit = 1.0f;
 constexpr float kPi = 3.14159265f;
 
@@ -128,6 +129,15 @@ void splitPlaylistOptions(std::string& source, VideoConfig::PlaylistEntry& optio
             options.items = trimPlaylistText(option.substr(6));
         } else if (lower == "stream") {
             options.streamOnly = true;
+        } else if (lower.starts_with("cookies=")) {
+            options.cookies = trimPlaylistText(option.substr(8));
+        } else if (lower == "slideshow") {
+            options.slideSeconds = kSlideSeconds;
+        } else if (lower.starts_with("slideshow=")) {
+            char* end = nullptr;
+            const std::string number = trimPlaylistText(option.substr(10));
+            const double seconds = std::strtod(number.c_str(), &end);
+            options.slideSeconds = number.empty() || *end || !(seconds > 0) ? kSlideSeconds : std::clamp(seconds, 2.0, 3600.0);
         } else {
             return;
         }
@@ -291,6 +301,19 @@ std::filesystem::path findTool(const std::filesystem::path& configured, const ch
     return {};
 }
 
+constexpr std::size_t kMaxSlides = 20000;
+
+// "%USERPROFILE%\Pictures" -> "C:\Users\me\Pictures" (unknown variables stay as written).
+std::wstring expandEnvironment(const std::wstring& text)
+{
+    if (text.find(L'%') == std::wstring::npos) return text;
+    std::wstring out(32768, L'\0');
+    const DWORD n = ExpandEnvironmentStringsW(text.c_str(), out.data(), static_cast<DWORD>(out.size()));
+    if (n == 0 || n > out.size()) return text;
+    out.resize(n - 1);
+    return out;
+}
+
 bool isVideoFile(const std::filesystem::path& p)
 {
     const std::wstring ext = p.extension().wstring();
@@ -361,12 +384,21 @@ void tvNotice(int channel, Osd::Icon icon, const std::string& label, const std::
     osd.until = std::chrono::steady_clock::now() + std::chrono::seconds((detail.empty() ? 3 : 4) * g_noticeScale);
     showOsd(channel, osd);
 }
+
+std::string signInMessage()
+{
+    return "Video Screen: YouTube asks to sign in. It is left alone for " + std::to_string(VideoFetcher::kSignInPause.count()) +
+           " min; add |cookies=firefox to the playlist in ScreenSFSE.ini to sign in.";
+}
 }
 
 ScreenController::ScreenController(Logger& logger, const VideoConfig& config, const std::vector<ChannelInfo>& channels) :
     logger_(logger), config_(config)
 {
-    // Default Data\VideoScreen in the game folder, as the radio's root_path=Data\Radio (players did not find their
+#ifndef SCREENSFSE_HARNESS
+    textureLive_ = surfaceLive;   // see setTextureCheck
+#endif
+    // Default Data\VideoScreen in the game folder, as the radio's root_path=Data\Radio (user: players did not find their
     // media under Documents). Not Data\Video: that is the game's own Bink video folder. A relative root_path is
     // relative to the game folder (the game's working directory).
     if (config_.rootDir.empty()) {
@@ -418,7 +450,7 @@ ScreenController::ScreenController(Logger& logger, const VideoConfig& config, co
         c->sessionFile = config_.rootDir / widen(info.key == "wall1" ? std::string("ScreenSFSE.session.txt")
                                                                        : "ScreenSFSE.session." + info.key + ".txt");
         loadSession(*c);
-        // stopped = switched off: black; the colour bars only while loading/buffering
+        // stopped = switched off: black (user, 2026-10-14); the colour bars only while loading/buffering
         c->idleCard = std::make_shared<BlackSource>(info.width, info.height);
         setFrameSource(info.id, c->idleCard);
         if (c->sessionPlaying || !c->pendingTrackKey.empty()) {
@@ -750,6 +782,7 @@ void ScreenController::finishLoad(std::uint32_t token, const ScreenProbe& probe)
             s.z = z;
             s.loaded = true;
             s.area = area;
+            s.registered = std::chrono::steady_clock::now();
             screen = screens_.find(c.sessionScreen);
             logger_.info(tag(c) + "Its screen is already loaded in the world (no OnLoad for this load).");
         }
@@ -781,7 +814,7 @@ std::vector<ScreenController::Playlist> ScreenController::buildPlaylists(
     std::set<std::string> names;
     std::vector<std::wstring> localPaths;
     auto localPath = [&](const std::string& value) {
-        auto path = std::filesystem::path(widen(value));
+        auto path = std::filesystem::path(expandEnvironment(widen(value)));   // %USERPROFILE%\Pictures
         if (path.is_relative()) path = config_.rootDir / path;
         return path.lexically_normal().wstring();
     };
@@ -802,7 +835,14 @@ std::vector<ScreenController::Playlist> ScreenController::buildPlaylists(
         if (pl.online) {
             pl.items = entry.items;
             pl.streamOnly = entry.streamOnly;
+            pl.cookies = entry.cookies;
+            if (lowerPlaylistText(pl.cookies).ends_with(".txt")) {
+                std::filesystem::path file = widen(pl.cookies);   // relative = to the video root (Data\VideoScreen)
+                if (file.is_relative()) file = config_.rootDir / file;
+                pl.cookies = narrow(file.wstring());
+            }
         } else {
+            pl.slideSeconds = entry.slideSeconds;
             localPaths.push_back(localPath(pl.source));
             pl.source = narrow(localPaths.back()); // stable identity for relative/absolute INI aliases and folder discovery
             listLocal(pl);
@@ -920,6 +960,20 @@ void ScreenController::listLocal(Playlist& pl) const
     std::error_code ec;
     if (std::filesystem::is_regular_file(p, ec)) {
         pl.tracks.push_back({ narrow(p.wstring()), narrow(p.stem().wstring()) });
+    } else if (pl.slideSeconds > 0) {
+        // pictures, subfolders too (photo folders are often sorted by year or trip), in path order
+        std::vector<std::filesystem::path> files;
+        const auto options = std::filesystem::directory_options::skip_permission_denied;
+        for (std::filesystem::recursive_directory_iterator it(p, options, ec), end; it != end && !ec && files.size() < kMaxSlides;
+             it.increment(ec)) {
+            if (it->is_regular_file(ec) && SlideshowPlayer::pictureFile(it->path())) {
+                files.push_back(it->path());
+            }
+        }
+        std::sort(files.begin(), files.end());
+        for (const auto& f : files) {
+            pl.tracks.push_back({ narrow(f.wstring()), narrow(f.stem().wstring()) });
+        }
     } else {
         std::vector<std::filesystem::path> files;
         for (std::filesystem::directory_iterator it(p, ec), end; it != end && !ec; it.increment(ec)) {
@@ -1067,7 +1121,7 @@ void ScreenController::refreshListLocked(Playlist& pl)
                 saveSessionLocked(*c);
             }
         }
-    }, pl.items);
+    }, pl.items, pl.cookies);
 }
 
 // True when the playlist's tracks are known. Otherwise starts listing it (online) and plays channel c from `at` when done.
@@ -1115,13 +1169,14 @@ bool ScreenController::ensureListedLocked(Channel& c, Playlist& pl, double at)
                 }
                 if (!ok) {
                     ch->state = State::Idle;
-                    showErrorLocked(*ch, "NO SIGNAL", name);
-                    ch->pendingMessage = "Video Screen: cannot list the playlist - " + shorten(error, 100);
+                    showErrorLocked(*ch, "NO SIGNAL", name, error);
+                    ch->pendingMessage = error == VideoFetcher::kSignInError ? signInMessage()
+                                                                             : "Video Screen: cannot list the playlist - " + shorten(error, 100);
                     continue;
                 }
                 playCurrentLocked(*ch, ch->resumeAt);
             }
-        }, pl.items);
+        }, pl.items, pl.cookies);
     }
     c.resumeAt = at;
     c.state = State::Fetching;
@@ -1171,6 +1226,12 @@ void ScreenController::setPlayerArea(ScreenLocation::Context context)
 bool ScreenController::screenEligibleLocked(const Screen& s) const
 {
     if (!s.loaded) return false;
+    if (textureLive_) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto seen = textureSeen_.find(s.channel);
+        const bool textured = seen != textureSeen_.end() && now - seen->second <= textureGrace_;
+        if (!textured && now - s.registered > registerGrace_) return false;   // nothing of it is drawn anywhere
+    }
     if (!areaTracking_) return true;
     if (!playerArea_.area.cell || !s.area.cell) return false;
     if (s.area.world) return s.area.world == playerArea_.area.world || s.area.world == playerArea_.visibleWorld;
@@ -1180,18 +1241,29 @@ bool ScreenController::screenEligibleLocked(const Screen& s) const
 bool ScreenController::selectAudienceLocked(Channel& c)
 {
     updatePlayerAreaLocked();
-    if (const auto it = screens_.find(c.active); it != screens_.end() && screenEligibleLocked(it->second)) return true;
+    refreshTexturesLocked();
+    float px = lastPlayer_[0], py = lastPlayer_[1], pz = lastPlayer_[2], heading = 0;
+    if (playerPositionVerified_) readPlayer(px, py, pz, heading);
+    auto distance2 = [&](const Screen& s) {
+        const double dx = s.x - px, dy = s.y - py, dz = s.z - pz;
+        return dx * dx + dy * dy + dz * dz;
+    };
     // A channel is shared, but its sound/playback owner must be a device in the player's current area.
     std::uint32_t replacement = 0;
     double nearest = 1e100;
     for (const auto& [id, s] : screens_) {
         if (s.channel != c.info.id || !screenEligibleLocked(s)) continue;
-        const double dx = s.x - lastPlayer_[0], dy = s.y - lastPlayer_[1], dz = s.z - lastPlayer_[2];
-        const double distance = dx * dx + dy * dy + dz * dz;
+        const double distance = distance2(s);
         if (distance < nearest || (distance == nearest && id < replacement)) {
             replacement = id;
             nearest = distance;
         }
+    }
+    if (const auto it = screens_.find(c.active); it != screens_.end() && screenEligibleLocked(it->second)) {
+        // Keep it, unless it is out of earshot and another screen of the channel is nearer (two outposts on one
+        // planet: the sound must come from the one the player is at).
+        const double silent = config_.silentMeters * c.info.soundRange / kMetersPerUnit;
+        if (replacement == 0 || replacement == c.active || distance2(it->second) <= silent * silent) return true;
     }
     if (!replacement) return false;
     c.active = replacement;
@@ -1211,6 +1283,29 @@ void ScreenController::suspendLocked(Channel& c)
     c.resumeOnLoad = true;
     saveSessionLocked(c);
     logger_.info(tag(c) + "Playback suspended outside the player's area; position kept.");
+}
+
+void ScreenController::setTextureCheck(std::function<bool(int)> live, std::chrono::milliseconds textureGrace,
+                                       std::chrono::milliseconds registerGrace)
+{
+    std::lock_guard lock(mutex_);
+    textureLive_ = std::move(live);
+    textureGrace_ = textureGrace;
+    registerGrace_ = registerGrace;
+    textureSeen_.clear();
+    refreshTexturesLocked();
+}
+
+void ScreenController::refreshTexturesLocked()
+{
+    if (!textureLive_) return;
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& cp : channels_) {
+        const int id = cp->info.id;
+        if (textureLive_(id)) {
+            textureSeen_[id] = now;
+        }
+    }
 }
 
 void ScreenController::reconcileAudienceLocked()
@@ -1246,12 +1341,30 @@ void ScreenController::showIdleLocked(Channel& c)
     c.loadingCard.reset();   // its thread ends with it
 }
 
-// A media error: TV static (silent) until the next action, under a notice saying what failed.
-void ScreenController::showErrorLocked(Channel& c, const std::string& label, const std::string& detail)
+// The error card's reason lines: yt-dlp's "ERROR: [youtube] <id>: Video unavailable" -> "VIDEO UNAVAILABLE".
+static std::vector<std::string> errorReason(const std::string& error)
 {
-    setFrameSource(c.info.id, std::make_shared<NoiseSource>(c.info.width, c.info.height));
+    if (error == VideoFetcher::kSignInError) {
+        return { "YOUTUBE ASKS TO SIGN IN", "RETRY LATER OR USE COOKIES" };
+    }
+    std::string why = error;
+    if (why.starts_with("ERROR: ")) why.erase(0, 7);
+    if (why.starts_with("[")) {   // "[extractor] id: "
+        const auto colon = why.find(": ", why.find(']'));
+        if (colon != std::string::npos) why.erase(0, colon + 2);
+    }
+    if (why.empty()) return {};
+    return { osdText(why, 40) };
+}
+
+// A media error: TV static (silent) until the next action, with a banner saying what failed.
+void ScreenController::showErrorLocked(Channel& c, const std::string& label, const std::string& detail, const std::string& error)
+{
+    std::vector<std::string> lines;
+    if (!detail.empty()) lines.push_back(osdText(detail, 40));
+    for (auto& l : errorReason(error)) lines.push_back(std::move(l));
+    setFrameSource(c.info.id, std::make_shared<NoiseSource>(c.info.width, c.info.height, osdText(label, 24), std::move(lines)));
     c.loadingCard.reset();
-    tvNotice(c.info.id, Osd::Icon::Stop, label, detail);
 }
 
 std::string ScreenController::playCurrentLocked(Channel& c, double at)
@@ -1281,12 +1394,17 @@ std::string ScreenController::playCurrentLocked(Channel& c, double at)
     if (pl.tracks.empty()) {
         c.state = State::Idle;
         showIdleLocked(c);
+        if (pl.slideSeconds > 0) return "Video Screen: " + pl.name + " has no pictures (" + shorten(pl.source, 80) + ")";
         return "Video Screen: " + pl.name + " is empty" + (pl.online ? "" : " (add videos to Data\\Video\\Videos)");
     }
     if (c.track >= pl.tracks.size()) {
         c.track = 0;
     }
     const Track track = pl.tracks[c.track];
+    if (pl.slideSeconds > 0) {
+        startSlideshowLocked(c, pl, at);
+        return c.state == State::Playing ? "Slideshow: " + shorten(pl.name, 60) : "Video Screen: cannot show " + shorten(pl.name, 60);
+    }
     if (!pl.online) {
         startFileLocked(c, widen(track.key), at);
         return c.state == State::Playing ? "Playing: " + shorten(track.title, 60) : "Video Screen: cannot play " + shorten(track.title, 60);
@@ -1308,6 +1426,7 @@ std::string ScreenController::playCurrentLocked(Channel& c, double at)
     const bool cached = fetcher_->cachedFile(track.key).has_value();
     showLoadingLocked(c);   // existing downloads may need a one-time compatibility copy too
     const int id = c.info.id;
+    const std::string cookies = pl.cookies;
     fetcher_->request(track.key, [this, id, generation, at, title = track.title](bool ok, const std::filesystem::path& file,
                                                                                  const std::string& error) {
         std::lock_guard lock(mutex_);
@@ -1331,12 +1450,13 @@ std::string ScreenController::playCurrentLocked(Channel& c, double at)
         }
         if (!ok) {
             ch->state = State::Idle;
-            showErrorLocked(*ch, "NO SIGNAL", title);
-            ch->pendingMessage = "Video Screen: could not load (" + shorten(title, 40) + ") - " + shorten(error, 80);
+            showErrorLocked(*ch, "NO SIGNAL", title, error);
+            ch->pendingMessage = error == VideoFetcher::kSignInError ? signInMessage()
+                                                                     : "Video Screen: could not load (" + shorten(title, 40) + ") - " + shorten(error, 80);
             return;
         }
         startFileLocked(*ch, file, at);
-    }, track.url);
+    }, track.url, cookies);
     return (cached ? "Loading: " : "Downloading: ") + shorten(track.title, 60);
 }
 
@@ -1380,6 +1500,12 @@ void ScreenController::streamLocked(Channel& c, const Track& track, double at)
         if (!ch || generation != ch->generation || ch->state != State::Fetching) {
             return;
         }
+        if (!ok && error == VideoFetcher::kSignInError) {   // not a broadcast that ended: don't relist
+            ch->state = State::Idle;
+            showErrorLocked(*ch, live ? "OFF AIR" : "NO SIGNAL", title, error);
+            ch->pendingMessage = signInMessage();
+            return;
+        }
         if (!ok && live) {
             ch->state = State::Idle;
             ch->pendingMessage = "Live stream unavailable (" + shorten(title, 40) + ") - " + shorten(error, 80);
@@ -1388,12 +1514,12 @@ void ScreenController::streamLocked(Channel& c, const Track& track, double at)
         }
         if (!ok) {
             ch->state = State::Idle;
-            showErrorLocked(*ch, "NO SIGNAL", title);
+            showErrorLocked(*ch, "NO SIGNAL", title, error);
             ch->pendingMessage = "Video Screen: could not stream (" + shorten(title, 40) + ") - " + shorten(error, 80);
             return;
         }
         startLiveLocked(*ch, video, audio, live ? -1.0 : at, duration, headers);
-    }, track.url);
+    }, track.url, playlists_[c.playlist].cookies);
 }
 
 // A broadcast ended: channel /live URLs (and some playlists) list a new video ID for the next one. Says so on the
@@ -1420,7 +1546,7 @@ void ScreenController::startLiveLocked(Channel& c, const std::string& videoUrl, 
                                                config_.liveBufferSeconds);
     if (!player->open(videoUrl, audioUrl, startAt, duration, headers)) {
         c.state = State::Idle;
-        showErrorLocked(c, "NO SIGNAL", trackLabelLocked(c));
+        showErrorLocked(c, "NO SIGNAL", trackLabelLocked(c), player->lastError());
         c.pendingMessage = "Video Screen: " + player->lastError();
         return;
     }
@@ -1451,7 +1577,7 @@ void ScreenController::startFileLocked(Channel& c, const std::filesystem::path& 
     auto player = std::make_shared<MediaPlayer>(logger_, c.info.width, c.info.height);
     if (!player->open(file, at)) {
         c.state = State::Idle;
-        showErrorLocked(c, "NO SIGNAL", trackLabelLocked(c));
+        showErrorLocked(c, "NO SIGNAL", trackLabelLocked(c), player->lastError());
         c.pendingMessage = "Video Screen: " + player->lastError();
         return;
     }
@@ -1470,17 +1596,52 @@ void ScreenController::startFileLocked(Channel& c, const std::filesystem::path& 
     cv_.notify_all();
 }
 
+void ScreenController::startSlideshowLocked(Channel& c, const Playlist& pl, double at)
+{
+    if (!selectAudienceLocked(c)) { c.resumeAt = at; suspendLocked(c); return; }
+    std::vector<std::filesystem::path> files;
+    files.reserve(pl.tracks.size());
+    for (const auto& t : pl.tracks) files.push_back(widen(t.key));
+    auto player = std::make_shared<SlideshowPlayer>(logger_, c.info.width, c.info.height, std::move(files), c.track, pl.slideSeconds);
+    player->start(at);
+    logger_.info(tag(c) + "Slideshow " + pl.name + ": " + std::to_string(pl.tracks.size()) + " pictures, " +
+                 std::to_string(static_cast<int>(pl.slideSeconds)) + " s each, from " + trackLabelLocked(c));
+    c.started = std::chrono::steady_clock::now();
+    c.player = player;
+    c.slides = player;
+    c.currentFile.clear();
+    c.state = State::Playing;
+    c.resumeAt = at;
+    setFrameSource(c.info.id, player);
+    c.loadingCard.reset();
+    saveSessionLocked(c);
+    cv_.notify_all();
+}
+
+std::string ScreenController::stepSlideLocked(Channel& c, int delta)
+{
+    const Playlist& pl = playlists_[c.playlist];
+    if (pl.tracks.empty()) return {};
+    const std::size_t n = pl.tracks.size();
+    c.track = delta > 0 ? (c.track + 1) % n : (c.track + n - 1) % n;
+    c.slides->show(c.track);
+    c.resumeAt = 0;
+    saveSessionLocked(c);
+    tvNotice(c.info.id, delta > 0 ? Osd::Icon::Next : Osd::Icon::Previous, delta > 0 ? "NEXT" : "PREV", trackLabelLocked(c));
+    return "Picture " + std::to_string(c.track + 1) + "/" + std::to_string(n) + ": " + shorten(pl.tracks[c.track].title, 60);
+}
+
 void ScreenController::prefetchNextLocked(const Channel& c)
 {
     const Playlist& pl = playlists_[c.playlist];
     if (pl.online && pl.tracks.size() > 1) {
         const Track& next = pl.tracks[(c.track + 1) % pl.tracks.size()];
         if (next.status != "is_live" && next.status != "is_upcoming" && !streamedLocked(c, next)) {
-            fetcher_->prefetch(next.key, next.url);
+            fetcher_->prefetch(next.key, next.url, pl.cookies);
             bool allowUntagged = true;
             const auto languages = subtitleLanguagesLocked(c, allowUntagged);
             if (!languages.empty() && c.subtitleChoice != "off") {
-                fetchSubtitlesLocked(next.key, languages, nullptr, next.url);
+                fetchSubtitlesLocked(next.key, languages, nullptr, next.url, pl.cookies);
             }
         }
     }
@@ -1549,7 +1710,7 @@ void ScreenController::applySubtitlesLocked(Channel& c, bool fetch)
             return std::any_of(languages.begin(), languages.end(), [&](const std::string& l) { return Subtitles::sameLanguage(s.language, l); });
         });
         if (!cached) {
-            fetchSubtitlesLocked(t->key, languages, &c, t->url);
+            fetchSubtitlesLocked(t->key, languages, &c, t->url, playlists_[c.playlist].cookies);
         }
     }
 }
@@ -1557,7 +1718,7 @@ void ScreenController::applySubtitlesLocked(Channel& c, bool fetch)
 // Caller holds mutex_. Once per video and language list per game session; when done, a channel still on that video
 // shows them.
 void ScreenController::fetchSubtitlesLocked(const std::string& videoId, const std::vector<std::string>& languages, Channel* forChannel,
-                                            const std::string& url)
+                                            const std::string& url, const std::string& cookies)
 {
     std::string key = videoId + "|";
     for (const auto& l : languages) {
@@ -1585,7 +1746,7 @@ void ScreenController::fetchSubtitlesLocked(const std::string& videoId, const st
             }
         };
     }
-    fetcher_->requestSubtitles(videoId, languages, std::move(done), url);
+    fetcher_->requestSubtitles(videoId, languages, std::move(done), url, cookies);
 }
 
 std::string ScreenController::cycleSubtitlesLocked(Channel& c)
@@ -1615,7 +1776,7 @@ std::string ScreenController::cycleSubtitlesLocked(Channel& c)
             }
             subtitlesRequested_.erase(key);   // asked by the player: try again
             c.subtitleChoice.clear();
-            fetchSubtitlesLocked(t->key, languages, &c, t->url);
+            fetchSubtitlesLocked(t->key, languages, &c, t->url, playlists_[c.playlist].cookies);
             tvNotice(c.info.id, Osd::Icon::None, "SUBTITLES...");
             return "Subtitles: looking for them online";
         }
@@ -1676,6 +1837,7 @@ void ScreenController::stopLocked(Channel& c, const char* why)
     c.captions.reset();   // holds the player too; its caption thread ends here
     c.subtitleOn = false;
     c.player.reset();   // the surface released its reference in setFrameSource; this joins the decode threads
+    c.slides.reset();
     c.streamVideo.clear();
     c.streamAudio.clear();
     c.streamHeaders.clear();
@@ -1689,6 +1851,15 @@ double ScreenController::positionLocked(const Channel& c) const
 
 void ScreenController::onTrackFinishedLocked(Channel& c)
 {
+    if (c.slides) {   // a slideshow loops by itself: it only ends when no picture can be read
+        const std::string why = c.slides->lastError();
+        const std::string name = playlists_[c.playlist].name;
+        stopLocked(c, "slideshow failed");
+        showErrorLocked(c, "NO SIGNAL", name, why);
+        c.pendingMessage = "Video Screen: " + name + " - " + why;
+        saveSessionLocked(c);
+        return;
+    }
     const bool early = c.player && (std::chrono::steady_clock::now() - c.started < std::chrono::seconds(15) || c.player->stalled());
     if (c.player && c.player->live() && early) {
         // a live stream that fails at once would restart in a loop: stop and say why
@@ -1709,7 +1880,7 @@ void ScreenController::onTrackFinishedLocked(Channel& c)
         const std::string label = trackLabelLocked(c);
         c.resumeAt = positionLocked(c);
         stopLocked(c, "stream failed");
-        showErrorLocked(c, "NO SIGNAL", label);
+        showErrorLocked(c, "NO SIGNAL", label, why);
         c.pendingMessage = "Video Screen: the stream stopped - " + shorten(why, 100);
         saveSessionLocked(c);
         return;
@@ -1744,6 +1915,7 @@ void ScreenController::registerScreen(std::uint32_t formId, int channel, float x
     s.z = z;
     s.loaded = true;
     s.area = area;
+    s.registered = std::chrono::steady_clock::now();
     lastPlayer_[0] = px;
     lastPlayer_[1] = py;
     lastPlayer_[2] = pz;
@@ -1851,6 +2023,9 @@ std::string ScreenController::action(std::uint32_t formId, int act)
         if (pl->tracks.empty()) {
             return "Video Screen: " + pl->name + " is empty";
         }
+        if (c.slides && pl->tracks.size() > 1) {
+            return stepSlideLocked(c, act == NextTrack ? 1 : -1);
+        }
         if (pl->tracks.size() == 1 && wasActive && !(act == PreviousTrack && positionLocked(c) > 5.0)) {
             return pl->name + " has one video. Next Playlist switches lists.";
         }
@@ -1873,6 +2048,9 @@ std::string ScreenController::action(std::uint32_t formId, int act)
     case SeekForward: {
         if (c.player && c.player->live()) {
             return "Live stream: no seeking";
+        }
+        if (c.slides) {   // pictures: forward / back step through them like Next / Previous
+            return stepSlideLocked(c, act == SeekForward ? 1 : -1);
         }
         const double delta = act == SeekForward ? config_.seekSeconds : -config_.seekSeconds;
         double target = std::max(0.0, positionLocked(c) + delta);
@@ -2085,8 +2263,8 @@ bool ScreenController::musicMuteWanted(float playerX, float playerY, float playe
     std::string why;
     for (const auto& cp : channels_) {
         const Channel& c = *cp;
-        if (!config_.muteGameMusic || (c.state != State::Playing && c.state != State::Fetching)) {
-            continue;
+        if (!config_.muteGameMusic || (c.state != State::Playing && c.state != State::Fetching) || c.slides) {
+            continue;   // slideshows are silent
         }
         const auto it = screens_.find(c.active);
         if (it == screens_.end() || !screenEligibleLocked(it->second)) {
@@ -2114,7 +2292,7 @@ float ScreenController::soundSourceRange(std::uint32_t formId)
     std::lock_guard lock(mutex_);
     const auto it = screens_.find(formId);
     Channel* c = it != screens_.end() ? channelById(it->second.channel) : nullptr;
-    if (!config_.muteGameMusic || !c || c->active != formId || (c->state != State::Playing && c->state != State::Fetching)) {
+    if (!config_.muteGameMusic || !c || c->active != formId || (c->state != State::Playing && c->state != State::Fetching) || c->slides) {
         return 0.0f;
     }
     return config_.silentMeters * c->info.soundRange / kMetersPerUnit;
@@ -2202,6 +2380,11 @@ void ScreenController::spatialLoop()
             if (c.player->finished()) {
                 onTrackFinishedLocked(c);
                 continue;
+            }
+            if (c.slides && c.slides->index() != c.track) {   // the slideshow moved on: the session follows it
+                c.track = c.slides->index();
+                c.resumeAt = 0;
+                saveSessionLocked(c);
             }
             updateGainsLocked(c);
             if (now - c.lastSessionSave >= std::chrono::seconds(5)) {

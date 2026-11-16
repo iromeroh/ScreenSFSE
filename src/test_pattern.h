@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -77,10 +78,11 @@ private:
 
 // A media error: animated TV static (grey snow with a slow rolling bright band), redrawn about 15 times a second on
 // the staging thread. Each row is a random slice of a small pre-made noise tile, so a frame costs one row copy each.
+// With a label, a banner says what failed for as long as the card shows (drawBanner: NO SIGNAL, the title, why).
 class NoiseSource : public FrameSource
 {
 public:
-    NoiseSource(std::uint32_t width, std::uint32_t height);
+    NoiseSource(std::uint32_t width, std::uint32_t height, std::string label = {}, std::vector<std::string> lines = {});
 
     std::uint64_t copyLatest(std::uint64_t lastSeq, std::uint8_t* dst, std::uint32_t dstPitch) override;
 
@@ -92,4 +94,6 @@ private:
     std::vector<std::uint32_t> tile_;     // kTileRows rows of 2 * kTileWidth pixels (doubled: a slice never wraps)
     std::vector<std::uint32_t> bright_;   // the same rows, brighter: the rolling band
     std::uint64_t seed_{ 0x9E3779B97F4A7C15ull };
+    const std::string label_;
+    const std::vector<std::string> lines_;
 };

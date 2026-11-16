@@ -6,6 +6,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -53,6 +54,11 @@ public:
     static constexpr const char* kLiveError = "live stream";
     // request()'s error when the site offers no H.264 MP4 to download: stream it with requestStream() instead.
     static constexpr const char* kStreamOnlyError = "stream only";
+    // Any call's error when YouTube asks for a sign-in ("Sign in to confirm you're not a bot"). From then on, YouTube
+    // calls with the same cookies (or none) fail at once with it for kSignInPause, so the game does not keep asking;
+    // cached videos still play. Other sites, and YouTube calls with other cookies, go on.
+    static constexpr const char* kSignInError = "YouTube asks to sign in";
+    static constexpr std::chrono::minutes kSignInPause{ 30 };
 
     explicit VideoFetcher(Logger& logger);
     ~VideoFetcher();
@@ -73,23 +79,28 @@ public:
     // Downloads (or finds in the cache), prepares an MF-compatible copy, then calls done on the fetcher thread.
     // Original downloads are preserved; only the prepared path is handed to the player.
     // A newer request replaces a queued one; a running download finishes first.
-    void request(const std::string& videoId, Done done, const std::string& url = {});
+    // cookies (every call): "" = none; a yt-dlp --cookies-from-browser spec ("firefox", "firefox:profile"), or an absolute
+    // path to a Netscape cookies .txt file (--cookies). For sites that ask for a sign-in (YouTube's bot check).
+    void request(const std::string& videoId, Done done, const std::string& url = {}, const std::string& cookies = {});
     // Downloads/prepares in the background if not ready (next track), after any queued request; no callback.
-    void prefetch(const std::string& videoId, const std::string& url = {});
+    void prefetch(const std::string& videoId, const std::string& url = {}, const std::string& cookies = {});
     // The videos of a playlist or page, in order (a single video gives one): yt-dlp --flat-playlist --print
     // "<extractor> <id> <live_status> <entry url> <page url> <title>". items: yt-dlp --playlist-items ("" = all).
     // Runs before queued downloads.
-    void requestList(const std::string& url, ListDone done, const std::string& items = {});
+    void requestList(const std::string& url, ListDone done, const std::string& items = {}, const std::string& cookies = {});
     // The stream URLs of a video (yt-dlp -g): a live stream while it runs, or a video that is not downloaded.
     // Runs before queued downloads.
-    void requestStream(const std::string& videoId, StreamDone done, const std::string& url = {});
+    void requestStream(const std::string& videoId, StreamDone done, const std::string& url = {},
+                       const std::string& cookies = {});
     // Subtitles of a video in the given languages, into <cacheDir>\subs\<id>.<lang>.vtt (Subtitles::find reads them).
     // First the uploader's subtitles (yt-dlp --write-subs); only if there are none, YouTube's automatic captions in the
     // video's spoken language (<lang>-orig). Machine translations are never requested: YouTube refuses them with
     // HTTP 429 at once. Runs after queued downloads; done (may be empty) gets whether a file was written.
     using SubtitlesDone = std::function<void(bool found)>;
     void requestSubtitles(const std::string& videoId, const std::vector<std::string>& languages, SubtitlesDone done,
-                          const std::string& url = {});
+                          const std::string& url = {}, const std::string& cookies = {});
+    // yt-dlp's arguments for a cookies value (see request): none, --cookies-from-browser <spec> or --cookies <file>.
+    static std::vector<std::wstring> cookieArgs(const std::string& cookies);
     std::filesystem::path subtitlesDir() const;
     void shutdown();
 
@@ -108,6 +119,7 @@ private:
         Kind kind{ Kind::Download };
         std::string arg;   // video key, or playlist URL
         std::string url;   // the video's URL (empty = YouTube by key); a listing's --playlist-items
+        std::string cookies;   // see request()
         Done done;
         ListDone listDone;
         StreamDone streamDone;
@@ -120,7 +132,12 @@ private:
     void runList(Job& job);
     void runStream(Job& job);
     void runSubtitles(Job& job);
-    std::vector<std::wstring> baseArgs(const Settings& s) const;
+    std::vector<std::wstring> baseArgs(const Settings& s, const Job& job) const;
+    static bool youTubeJob(const Job& job);
+    // True while YouTube calls with the job's cookies are paused (the job then fails with kSignInError, no yt-dlp run).
+    bool signInPaused(const Job& job);
+    // After a failed run: whether yt-dlp's error is YouTube's sign-in check; if so, starts the pause.
+    bool noteSignIn(const Job& job, const std::string& err);
     static std::wstring videoUrl(const Job& job);
     std::optional<std::filesystem::path> prepareVideo(const std::filesystem::path& original, std::string& error);
     void trimCache(const std::filesystem::path& requestedFile);
@@ -132,6 +149,7 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<Job> jobs_;
+    std::map<std::string, std::chrono::steady_clock::time_point> signInUntil_;   // by cookies value ("" = none)
     std::thread thread_;
     bool stop_{ false };
     std::atomic<bool> stopping_{ false };

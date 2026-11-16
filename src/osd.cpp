@@ -201,6 +201,32 @@ void drawOsd(std::uint8_t* frame, std::uint32_t pitch, std::uint32_t width, std:
     }
 }
 
+void drawBanner(std::uint8_t* frame, std::uint32_t pitch, std::uint32_t width, std::uint32_t height, const std::string& label,
+                const std::vector<std::string>& lines)
+{
+    const Canvas c{ frame, pitch, static_cast<int>(width), static_cast<int>(height) };
+    const int s = std::max(2, static_cast<int>(height) / 110);
+    const int s2 = std::max(2, s * 3 / 5);
+    const std::size_t shown = std::min<std::size_t>(lines.size(), 3);
+    int textW = static_cast<int>(label.size()) * 6 * s;
+    for (std::size_t i = 0; i < shown; ++i) {
+        textW = std::max(textW, static_cast<int>(lines[i].size()) * 6 * s2);
+    }
+    const int pad = 4 * s;
+    const int boxW = std::min(static_cast<int>(width), textW + 2 * pad);
+    const int boxH = 7 * s + static_cast<int>(shown) * 10 * s2 + 2 * pad;
+    const int x0 = (static_cast<int>(width) - boxW) / 2;
+    int y = (static_cast<int>(height) - boxH) / 2;
+    c.rect(x0, y, x0 + boxW, y + boxH, rgba(8, 10, 8));
+    y += pad;
+    text(c, (static_cast<int>(width) - static_cast<int>(label.size()) * 6 * s) / 2, y, s, label, kInk);
+    y += 7 * s + 3 * s2;
+    for (std::size_t i = 0; i < shown; ++i) {
+        text(c, (static_cast<int>(width) - static_cast<int>(lines[i].size()) * 6 * s2) / 2, y, s2, lines[i], kInk);
+        y += 10 * s2;
+    }
+}
+
 std::string osdText(const std::string& utf8, std::size_t maxChars)
 {
     std::string out;

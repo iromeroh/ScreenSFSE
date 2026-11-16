@@ -3,6 +3,7 @@
 #include "logger.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cwctype>
 #include <cstdio>
 #include <cstdlib>
@@ -260,7 +261,7 @@ std::optional<std::filesystem::path> VideoFetcher::cachedFile(const std::string&
     return std::nullopt;
 }
 
-void VideoFetcher::request(const std::string& videoId, Done done, const std::string& url)
+void VideoFetcher::request(const std::string& videoId, Done done, const std::string& url, const std::string& cookies)
 {
     std::lock_guard lock(mutex_);
     if (stop_) {
@@ -268,7 +269,7 @@ void VideoFetcher::request(const std::string& videoId, Done done, const std::str
     }
     // only the newest play request matters; queued prefetches go too (the next track changes with it), lists stay
     std::erase_if(jobs_, [](const Job& j) { return j.kind == Kind::Download || j.kind == Kind::Prefetch; });
-    Job job{ Kind::Download, videoId, url };
+    Job job{ Kind::Download, videoId, url, cookies };
     job.done = std::move(done);
     jobs_.push_back(std::move(job));
     if (!thread_.joinable()) {
@@ -277,27 +278,27 @@ void VideoFetcher::request(const std::string& videoId, Done done, const std::str
     cv_.notify_all();
 }
 
-void VideoFetcher::prefetch(const std::string& videoId, const std::string& url)
+void VideoFetcher::prefetch(const std::string& videoId, const std::string& url, const std::string& cookies)
 {
     // An older cached download may still need its compatibility copy. The worker's stamp check is cheap.
     std::lock_guard lock(mutex_);
     if (stop_) {
         return;
     }
-    jobs_.push_back(Job{ Kind::Prefetch, videoId, url });
+    jobs_.push_back(Job{ Kind::Prefetch, videoId, url, cookies });
     if (!thread_.joinable()) {
         thread_ = std::thread([this] { loop(); });
     }
     cv_.notify_all();
 }
 
-void VideoFetcher::requestList(const std::string& url, ListDone done, const std::string& items)
+void VideoFetcher::requestList(const std::string& url, ListDone done, const std::string& items, const std::string& cookies)
 {
     std::lock_guard lock(mutex_);
     if (stop_) {
         return;
     }
-    Job job{ Kind::List, url, items };
+    Job job{ Kind::List, url, items, cookies };
     job.listDone = std::move(done);
     jobs_.push_front(std::move(job));
     if (!thread_.joinable()) {
@@ -306,13 +307,14 @@ void VideoFetcher::requestList(const std::string& url, ListDone done, const std:
     cv_.notify_all();
 }
 
-void VideoFetcher::requestStream(const std::string& videoId, StreamDone done, const std::string& url)
+void VideoFetcher::requestStream(const std::string& videoId, StreamDone done, const std::string& url,
+                                 const std::string& cookies)
 {
     std::lock_guard lock(mutex_);
     if (stop_) {
         return;
     }
-    Job job{ Kind::Stream, videoId, url };
+    Job job{ Kind::Stream, videoId, url, cookies };
     job.streamDone = std::move(done);
     jobs_.push_front(std::move(job));
     if (!thread_.joinable()) {
@@ -322,7 +324,7 @@ void VideoFetcher::requestStream(const std::string& videoId, StreamDone done, co
 }
 
 void VideoFetcher::requestSubtitles(const std::string& videoId, const std::vector<std::string>& languages, SubtitlesDone done,
-                                    const std::string& url)
+                                    const std::string& url, const std::string& cookies)
 {
     std::lock_guard lock(mutex_);
     if (stop_ || languages.empty()) {
@@ -330,7 +332,7 @@ void VideoFetcher::requestSubtitles(const std::string& videoId, const std::vecto
     }
     // one queued job per video; a newer request (other languages, a callback) replaces it
     std::erase_if(jobs_, [&](const Job& j) { return j.kind == Kind::Subtitles && j.arg == videoId; });
-    Job job{ Kind::Subtitles, videoId, url };
+    Job job{ Kind::Subtitles, videoId, url, cookies };
     job.languages = languages;
     job.subtitlesDone = std::move(done);
     jobs_.push_back(std::move(job));
@@ -388,7 +390,7 @@ void VideoFetcher::runSubtitles(Job& job)
         names += std::wstring(names.empty() ? L"" : L", ") + w;
     }
     auto runPass = [&](bool automatic) {
-        std::vector<std::wstring> args = baseArgs(s);
+        std::vector<std::wstring> args = baseArgs(s, job);
         args.insert(args.end(), { L"--no-playlist", L"--skip-download", automatic ? L"--write-auto-subs" : L"--write-subs",
                                   L"--sub-format", L"vtt", L"--sub-langs", automatic ? original : manual, L"-o",
                                   (dir / id).wstring() + L".%(ext)s", L"--", videoUrl(job) });
@@ -398,13 +400,17 @@ void VideoFetcher::runSubtitles(Job& job)
         }
         std::string out, err;
         const bool ran = runProcess(commandLine, out, err);
-        if (!ran && !stopping_.load()) {
+        if (!ran && !stopping_.load() && !noteSignIn(job, err)) {
             logger_.warn("Subtitles for " + job.arg + ": yt-dlp failed - " + lastLine(err));
         }
         return ran;
     };
     if (written(false) || written(true)) {
         finish(true);
+        return;
+    }
+    if (signInPaused(job)) {
+        finish(false);
         return;
     }
     if (!runPass(false) || stopping_.load()) {
@@ -429,14 +435,66 @@ void VideoFetcher::runSubtitles(Job& job)
     finish(found);
 }
 
-std::vector<std::wstring> VideoFetcher::baseArgs(const Settings& s) const
+std::vector<std::wstring> VideoFetcher::cookieArgs(const std::string& cookies)
+{
+    if (cookies.empty()) {
+        return {};
+    }
+    std::string lower = cookies;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    if (lower.ends_with(".txt")) {
+        return { L"--cookies", widen(cookies) };
+    }
+    return { L"--cookies-from-browser", widen(cookies) };
+}
+
+std::vector<std::wstring> VideoFetcher::baseArgs(const Settings& s, const Job& job) const
 {
     std::vector<std::wstring> args = { L"--ignore-config", L"--no-warnings", L"--no-progress" };
     std::error_code ec;
     if (!s.deno.empty() && std::filesystem::exists(s.deno, ec)) {
         args.insert(args.end(), { L"--js-runtimes", L"deno:" + s.deno.wstring() });
     }
+    const auto cookies = cookieArgs(job.cookies);
+    args.insert(args.end(), cookies.begin(), cookies.end());
     return args;
+}
+
+bool VideoFetcher::youTubeJob(const Job& job)
+{
+    const std::string& url = job.kind == Kind::List ? job.arg : job.url;
+    if (url.empty()) {
+        return true;   // a video by its YouTube ID
+    }
+    std::string lower = url;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return lower.find("youtube.com") != std::string::npos || lower.find("youtu.be") != std::string::npos;
+}
+
+bool VideoFetcher::signInPaused(const Job& job)
+{
+    if (!youTubeJob(job)) {
+        return false;
+    }
+    std::lock_guard lock(mutex_);
+    const auto it = signInUntil_.find(job.cookies);
+    return it != signInUntil_.end() && std::chrono::steady_clock::now() < it->second;
+}
+
+bool VideoFetcher::noteSignIn(const Job& job, const std::string& err)
+{
+    if (err.find("Sign in to confirm") == std::string::npos || !youTubeJob(job)) {
+        return false;
+    }
+    {
+        std::lock_guard lock(mutex_);
+        signInUntil_[job.cookies] = std::chrono::steady_clock::now() + kSignInPause;
+    }
+    logger_.warn(std::string("YouTube asks to sign in (its bot check): no YouTube calls ") +
+                 (job.cookies.empty() ? "without cookies" : "with cookies " + job.cookies) + " for " +
+                 std::to_string(kSignInPause.count()) + " min. Cached videos still play. Add |cookies=firefox to a playlist "
+                 "line to sign in with a browser (see ScreenSFSE.ini).");
+    return true;
 }
 
 void VideoFetcher::runList(Job& job)
@@ -451,7 +509,11 @@ void VideoFetcher::runList(Job& job)
         job.listDone(false, {}, "yt-dlp.exe not found");
         return;
     }
-    std::vector<std::wstring> args = baseArgs(s);
+    if (signInPaused(job)) {
+        job.listDone(false, {}, kSignInError);
+        return;
+    }
+    std::vector<std::wstring> args = baseArgs(s, job);
     if (!job.url.empty()) {
         args.insert(args.end(), { L"--playlist-items", widen(job.url) });
     }
@@ -533,7 +595,8 @@ void VideoFetcher::runList(Job& job)
         tracks.push_back(Track{ key, e.title == "NA" ? e.id : e.title, e.status, from });
     }
     if (tracks.empty()) {
-        const std::string why = lastLine(err).empty() ? "no videos listed" : lastLine(err);
+        const std::string why = noteSignIn(job, err) ? std::string(kSignInError)
+                                : lastLine(err).empty() ? "no videos listed" : lastLine(err);
         logger_.warn("Could not list " + job.arg + ": " + why);
         job.listDone(false, {}, why);
         return;
@@ -616,6 +679,10 @@ void VideoFetcher::run(Job& job)
         prepareAndFinish(*file);
         return;
     }
+    if (signInPaused(job)) {
+        finish(false, {}, kSignInError);
+        return;
+    }
     Settings s;
     {
         std::lock_guard lock(mutex_);
@@ -644,6 +711,8 @@ void VideoFetcher::run(Job& job)
     if (!s.deno.empty() && std::filesystem::exists(s.deno, ec)) {
         args.insert(args.end(), { L"--js-runtimes", L"deno:" + s.deno.wstring() });
     }
+    const auto cookies = cookieArgs(job.cookies);
+    args.insert(args.end(), cookies.begin(), cookies.end());
     args.insert(args.end(), { L"--ffmpeg-location", s.ffmpeg.wstring(), L"--merge-output-format", L"mp4" });
     args.insert(args.end(), { L"-o", (s.cacheDir / std::filesystem::path(widen(videoId))).wstring() + L".%(ext)s",
                               L"--", videoUrl(job) });
@@ -652,7 +721,8 @@ void VideoFetcher::run(Job& job)
         commandLine += L" " + quoteArg(a);
     }
     logger_.info(std::string(job.kind == Kind::Prefetch ? "Prefetching" : "Downloading") + " video " + videoId +
-                 " (H.264 <= " + std::to_string(s.maxHeight) + "p + AAC)");
+                 " (H.264 <= " + std::to_string(s.maxHeight) + "p + AAC)" +
+                 (job.cookies.empty() ? std::string() : ", cookies " + job.cookies));
     const auto started = std::chrono::steady_clock::now();
     std::string out;
     std::string err;
@@ -675,7 +745,8 @@ void VideoFetcher::run(Job& job)
         logger_.info("Video " + videoId + " has no H.264 MP4 to download: it will be streamed.");
         finish(false, {}, kStreamOnlyError);
     } else {
-        const std::string why = lastLine(err).empty() ? "yt-dlp failed" : lastLine(err);
+        const std::string why = noteSignIn(job, err) ? std::string(kSignInError)
+                                : lastLine(err).empty() ? "yt-dlp failed" : lastLine(err);
         logger_.warn("Could not download video " + videoId + ": " + why);
         finish(false, {}, why);
     }
@@ -764,8 +835,12 @@ void VideoFetcher::runStream(Job& job)
         job.streamDone(false, {}, {}, 0.0, {}, "yt-dlp.exe not found");
         return;
     }
+    if (signInPaused(job)) {
+        job.streamDone(false, {}, {}, 0.0, {}, kSignInError);
+        return;
+    }
     const std::wstring h = std::to_wstring(s.maxHeight);
-    std::vector<std::wstring> args = baseArgs(s);
+    std::vector<std::wstring> args = baseArgs(s, job);
     // live HLS: YouTube serves video and sound as separate playlists (two URLs); a muxed one if offered.
     // --print duration and the HTTP headers (one JSON line) come before the URLs (duration "NA" for a live stream).
     args.insert(args.end(), { L"--no-playlist", L"-f",
@@ -808,7 +883,8 @@ void VideoFetcher::runStream(Job& job)
         start = end + 1;
     }
     if (!ran || urls.empty()) {
-        const std::string why = lastLine(err).empty() ? "no stream URL" : lastLine(err);
+        const std::string why = noteSignIn(job, err) ? std::string(kSignInError)
+                                : lastLine(err).empty() ? "no stream URL" : lastLine(err);
         logger_.warn("Could not open the stream of " + job.arg + ": " + why);
         job.streamDone(false, {}, {}, 0.0, {}, why);
         return;

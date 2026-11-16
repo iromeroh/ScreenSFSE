@@ -252,7 +252,7 @@ bool LivePlayer::start()
 
     // 1. fetch: the live HLS as fast as it comes (no decoding, no -re) -> MPEG-TS -> our buffer. On demand: from the
     // position reached (-ss on each input), into NUT, which carries VP9, AV1 and Opus (MPEG-TS does not) and HLS's
-    // ADTS AAC (Matroska does not: "Error parsing AAC extradata").
+    // ADTS AAC (Matroska does not: "Error parsing AAC extradata", in game 2026-10-25).
     const wchar_t* container = onDemand_ ? L"nut" : L"mpegts";
     std::vector<std::wstring> seek;
     if (onDemand_) {
@@ -262,7 +262,7 @@ bool LivePlayer::start()
         }
     }
     // Each input gets the CDN's headers (yt-dlp's): without them some answer every HLS segment with 410 Gone, and
-    // ffmpeg's HLS reader skips the segments with warnings only, so nothing ever arrives.
+    // ffmpeg's HLS reader skips the segments with warnings only, so nothing ever arrives (in game 2026-10-26).
     std::vector<std::wstring> input = seek;
     if (!userAgent_.empty()) {
         input.insert(input.end(), { L"-user_agent", widen(userAgent_) });
@@ -368,7 +368,7 @@ void LivePlayer::feedLoop(void* pipe)
             ringCv_.wait_for(lock, std::chrono::milliseconds(100));
             if (firstByte_ == std::chrono::steady_clock::time_point{} &&
                 std::chrono::steady_clock::now() - waitStart >= kNoDataTimeout) {
-                // e.g. a CDN refusing every HLS segment: ffmpeg only warns and keeps trying
+                // e.g. a CDN refusing every HLS segment: ffmpeg only warns and keeps trying (in game 2026-10-26)
                 stalled_.store(true);
                 lock.unlock();
                 fail("no data from the stream in " + std::to_string(kNoDataTimeout.count()) + " s");

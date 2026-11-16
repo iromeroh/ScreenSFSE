@@ -23,4 +23,4 @@ This notice covers the original ScreenSFSE software, scripts and build tools.
 Third-party notices remain applicable to their respective components.
 Bethesda game assets and user-supplied videos are not relicensed by this notice.
 
-See README.md for the project overview and BUILDING.md for build instructions.
+See README.md and BUILDING.md for source and build instructions.

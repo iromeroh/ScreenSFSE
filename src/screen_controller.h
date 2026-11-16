@@ -20,6 +20,7 @@ class FrameSource;
 class Logger;
 class MediaPlayer;
 class Playback;
+class SlideshowPlayer;
 class SubtitledSource;
 class TestPatternSource;
 class VideoFetcher;
@@ -42,6 +43,8 @@ struct VideoConfig
         std::string subtitles;   // playlist=Name|Source|subs=...: "" = subtitle_languages, "off", or languages "en,es"
         std::string items;       // |items=1,3-5: which of the page's videos (yt-dlp --playlist-items); "" = all
         bool streamOnly{ false };   // |stream: never downloaded, always streamed (sites whose links expire)
+        std::string cookies;     // |cookies=firefox or |cookies=cookies.txt: signed-in yt-dlp calls; "" = none
+        double slideSeconds{ 0 };   // |slideshow or |slideshow=8: a local folder of pictures, each shown that long, cross-faded
     };
     std::vector<PlaylistEntry> playlists;   // playlist=Name|Source lines, in order
     std::string source;                     // v2 single Source= (becomes a playlist "Video" when no playlist= lines)
@@ -66,9 +69,11 @@ struct VideoConfig
 
 // playlist= value "Source|subs=en,es" -> source "Source", subtitles "en,es" (unchanged without the option).
 void splitPlaylistOptions(std::string& source, std::string& subtitles);
-// The same with every trailing option, in any order: |subs=en,es |items=1,3-5 |stream. An unknown one stays in the
+// The same with every trailing option, in any order: |subs=en,es |items=1,3-5 |stream |cookies=firefox |slideshow[=seconds]
+// (default kSlideSeconds, 2 to 3600). An unknown one stays in the
 // source (a URL may hold '|').
 void splitPlaylistOptions(std::string& source, VideoConfig::PlaylistEntry& options);
+constexpr double kSlideSeconds = 10.0;
 // "es, en-US ,EN" -> {"es", "en-US"}: trimmed, duplicates (ignoring case) dropped.
 std::vector<std::string> splitLanguages(const std::string& list);
 
@@ -115,6 +120,13 @@ public:
                         ScreenLocation::Area area = {});
     // Explicit context input for offline lifecycle tests. Runtime reads the player's area on its existing worker.
     void setPlayerArea(ScreenLocation::Context context);
+    // A screen only counts as in the player's area while its channel's texture exists (seen within textureGrace), or
+    // for registerGrace after it registered (the texture follows its 3D). The area check alone cannot tell planets
+    // apart (every exterior reports the same world), and a screen resumed by a save load gets no OnUnload: without
+    // this, a channel kept playing unseen on another planet. In game: video_surface's surfaceLive. Offline tests
+    // pass their own (none = no texture check).
+    void setTextureCheck(std::function<bool(int channel)> live, std::chrono::milliseconds textureGrace = std::chrono::seconds(10),
+                         std::chrono::milliseconds registerGrace = std::chrono::seconds(30));
     // A menu action on a screen; returns a short message for the player (empty = none).
     std::string action(std::uint32_t formId, int action);
     // One line for the menu title: channel, state, track, time, volume, playlist.
@@ -171,6 +183,7 @@ private:
         float x{ 0 }, y{ 0 }, z{ 0 };
         bool loaded{ false };
         ScreenLocation::Area area;
+        std::chrono::steady_clock::time_point registered{};   // when it registered (or finishLoad assumed it loaded)
     };
 
     struct Track
@@ -189,6 +202,8 @@ private:
         std::string subtitles;     // the entry's subs= option ("" = subtitle_languages)
         std::string items;         // the entry's items= option
         bool streamOnly{ false };  // the entry's stream option
+        std::string cookies;       // the entry's cookies= option: a browser spec, or an absolute cookies .txt path
+        double slideSeconds{ 0 };  // a picture slideshow (local folder, subfolders too): seconds per picture; 0 = videos
         bool online{ false };      // listed and fetched with yt-dlp (else a local folder or file)
         bool listed{ false };
         bool listing{ false };
@@ -204,7 +219,8 @@ private:
         bool resumeOnLoad{ false };
         std::uint64_t generation{ 0 };   // bumps on every start/stop: stale download/list results are ignored
         std::string pendingMessage;
-        std::shared_ptr<Playback> player;   // MediaPlayer (file) or LivePlayer (live stream)
+        std::shared_ptr<Playback> player;   // MediaPlayer (file), LivePlayer (live stream) or SlideshowPlayer
+        std::shared_ptr<SlideshowPlayer> slides;   // the player when it is a slideshow (its picture is c.track)
         std::chrono::steady_clock::time_point started{};
         std::filesystem::path currentFile;
         std::string streamVideo, streamAudio;   // an on-demand stream's URLs (seeks reopen them), else empty
@@ -236,6 +252,9 @@ private:
     Channel* channelById(int id);
     std::string playCurrentLocked(Channel& c, double at);
     void startFileLocked(Channel& c, const std::filesystem::path& file, double at);
+    void startSlideshowLocked(Channel& c, const Playlist& pl, double at);
+    // A slideshow channel steps to the picture `delta` away (fading); returns the menu message.
+    std::string stepSlideLocked(Channel& c, int delta);
     // A live stream (status is_live/is_upcoming), or a video streamed on demand from `at`.
     void streamLocked(Channel& c, const Track& track, double at = 0.0);
     void liveFailedLocked(Channel& c, const std::string& key, const std::string& title);
@@ -249,7 +268,8 @@ private:
     void resumeLocked(Channel& c);
     void showLoadingLocked(Channel& c);
     void showIdleLocked(Channel& c);
-    void showErrorLocked(Channel& c, const std::string& label, const std::string& detail);
+    // TV static with a banner: label (NO SIGNAL, OFF AIR), detail (the title) and why (errorReason of `error`).
+    void showErrorLocked(Channel& c, const std::string& label, const std::string& detail, const std::string& error = {});
     bool ensureListedLocked(Channel& c, Playlist& pl, double at);
     void listLocal(Playlist& pl) const;
     std::vector<Playlist> buildPlaylists(const std::vector<VideoConfig::PlaylistEntry>& entries,
@@ -265,7 +285,7 @@ private:
     std::vector<std::string> subtitleLanguagesLocked(const Channel& c, bool& allowUntagged) const;
     void applySubtitlesLocked(Channel& c, bool fetch);
     void fetchSubtitlesLocked(const std::string& videoId, const std::vector<std::string>& languages, Channel* forChannel,
-                              const std::string& url = {});
+                              const std::string& url = {}, const std::string& cookies = {});
     std::string cycleSubtitlesLocked(Channel& c);
     void onTrackFinishedLocked(Channel& c);
     void spatialLoop();
@@ -277,6 +297,8 @@ private:
     bool selectAudienceLocked(Channel& c);
     void suspendLocked(Channel& c);
     void reconcileAudienceLocked();
+    // Notes which channels' textures exist now (screenEligibleLocked needs a recent one).
+    void refreshTexturesLocked();
     double positionLocked(const Channel& c) const;
     const Track* currentTrackLocked(const Channel& c) const;
     std::string trackLabelLocked(const Channel& c) const;
@@ -308,6 +330,10 @@ private:
     bool areaTracking_{ true };
 #endif
     ScreenLocation::Context playerArea_;
+    std::function<bool(int)> textureLive_;
+    std::chrono::milliseconds textureGrace_{ 10000 };
+    std::chrono::milliseconds registerGrace_{ 30000 };
+    std::unordered_map<int, std::chrono::steady_clock::time_point> textureSeen_;   // by channel id
     std::vector<std::pair<std::uint32_t, std::string>> remoteList_;   // remoteScreens' snapshot
     std::set<std::string> subtitlesRequested_;   // "<video id>|<languages>" asked of yt-dlp this game session
     int lastMusicMute_{ -1 };   // last musicMuteWanted answer, for the log (-1 = none yet)

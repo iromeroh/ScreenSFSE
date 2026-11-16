@@ -1,12 +1,11 @@
-; ScreenSFSE settings. tools/build_assets.py writes the staged copy, filling the surface size from config/screen.json.
+; ScreenSFSE settings. Keep a copy of this file when updating if you customize your playlists.
 ; The log is at Documents\My Games\Starfield\SFSE\Logs\ScreenSFSE.log.
 
 [General]
 LogLevel=Info
 
 [Surface]
-; Screen channels are built in (src\screen_channels.h, from config\screen.json): each screen variant's placeholder
-; texture is recognised in D3D12 by its exact size. Formats are DXGI numbers: 27 R8G8B8A8_TYPELESS, 28 _UNORM, 29 _SRGB.
+; Advanced rendering compatibility settings. Keep the defaults unless troubleshooting.
 Formats=27,28,29
 
 [Render]
@@ -36,6 +35,14 @@ Enabled=true
 ; |stream: never download, always stream (starts in seconds; for long videos, links that expire, or videos you don't
 ; want cached; streamed videos have no subtitles). |items=1,3-5: only those videos of a page or playlist.
 ; e.g. playlist=Archive|https://archive.org/details/BigBuckBunny_124|stream
+; |cookies=firefox: sign in with your browser's cookies when a site asks (YouTube's "Sign in to confirm you're not a
+; bot"). Use a browser supported by yt-dlp (e.g. firefox or firefox:<profile>), or a Netscape-format cookies
+; .txt file (absolute, or relative to the root folder). Cookies are optional and use your account.
+; Without cookies, YouTube's bot check pauses YouTube for 30 min (cached videos still play); the screen says so.
+; |slideshow or |slideshow=<seconds>: a folder of pictures (JPEG, PNG, BMP, GIF, TIFF; subfolders too) shown one by one,
+; each for that long (default 10, 2 to 3600), cross-fading into the next. Next/Previous and back/forward step pictures.
+; The folder: absolute, relative to the root folder, or with %VARIABLES%, e.g. the game's photo mode pictures:
+; playlist=Photos|%USERPROFILE%\Documents\My Games\Starfield\Data\Textures\Photos|slideshow=8
 playlist=Vangelis|https://www.youtube.com/watch?v=f2Bp-xkMc20
 ; Root folder for videos (Videos), the YouTube cache (Cache), tools (Tools) and the saved sessions. Empty: Data\VideoScreen
 ; in the game folder (like the radio's Data\Radio). A relative path is relative to the game folder.
@@ -48,7 +55,7 @@ deno_path=
 max_height=720
 ; Sound: starting volume (0-1; the menu's Volume +/- is remembered), step of Volume +/-, and the distance fade:
 ; full volume within full_volume_meters of the screen, silent from silent_meters. Video Billboards use twice both
-; distances (config/screen.json "sound_range"), so 4 m / 50 m with these values.
+; distances, so 4 m / 50 m with these values.
 volume=0.8
 volume_step=0.1
 full_volume_meters=2

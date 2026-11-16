@@ -10,7 +10,7 @@ Int Property OptionsMenuFormID = 0x80E AutoReadOnly   ; MESG ScreenSFSE_Playlist
 Int Property PerkFormID = 0x811 AutoReadOnly   ; PERK ScreenSFSE_ScreenPerk (the second activation)
 Int Property ButtonStop = 7 AutoReadOnly   ; main menu since 0.3: 0-6 = actions 0-6, 7 = Stop (action 8), 8 = Close
 
-; Earlier builds raised billboards from a script menu on placed metal columns. Placed columns could not be
+; Test builds of 2026-10-22 raised billboards from a script menu on placed metal columns. Placed columns could not be
 ; moved under the frame, and the native auto-foundation replaced them. Columns those builds left in a save are deleted
 ; here when their billboard loads, moves or is removed.
 ObjectReference[] Supports

@@ -145,7 +145,7 @@ private:
         const char* why = nullptr;
         auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(formId);
         // No walk of the player's cell here (TESObjectCELL::ForEachReference): its lock and layout are unverified for
-        // this game version, and walking it could crash while loading a save. A screen
+        // this game version, and the first in-game run with it crashed while loading a save (2026-10-23). A screen
         // LookupByID misses falls back to its channel texture plus the area saved in the snapshot.
         if (ref) area = ScreenLocation::reference(ref);
         if (!ref) {

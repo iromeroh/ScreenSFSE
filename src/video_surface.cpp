@@ -156,7 +156,7 @@ std::chrono::steady_clock::time_point g_lastStats{};
 std::uint64_t g_statUploads = 0;
 std::uint64_t g_statBusy = 0;
 // Staging thread: copies the frames into the upload buffers at fps, off the game's threads (the copies, 3-4 MB per
-// playing channel, would stutter inside the game's ExecuteCommandLists with two screens
+// playing channel, ran inside the game's ExecuteCommandLists until 2026-10-22: stutter with the TV and a billboard
 // playing). It sleeps on g_stagerCv while no screen texture is live.
 std::thread g_stager;
 std::mutex g_stagerMutex;
@@ -237,7 +237,7 @@ void maybeLogNearMiss(const char* api, const D3D12_RESOURCE_DESC& d)
         return;
     }
     // render targets, depth buffers and UAVs are never a placeholder texture: the game's 1280x800 targets used up
-    // the whole log budget before any screen loaded
+    // the whole log budget before any screen loaded (2026-10-22)
     constexpr auto kNotATexture = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     if (d.Flags & kNotATexture) {
@@ -246,8 +246,8 @@ void maybeLogNearMiss(const char* api, const D3D12_RESOURCE_DESC& d)
     const bool close = std::any_of(g_channels.begin(), g_channels.end(), [&d](const Channel& c) {
         return d.Width == c.width || d.Height == c.height;
     });
-    // any single-mip RGBA8 texture looks like a placeholder: logged once per size, whatever the size (a placeholder
-    // may not appear at its own size)
+    // any single-mip RGBA8 texture looks like a placeholder: logged once per size, whatever the size (the small wall
+    // screen's placeholder never appeared at its own size, 2026-10-22)
     const bool rgba = d.MipLevels == 1 && d.Format >= DXGI_FORMAT_R8G8B8A8_TYPELESS && d.Format <= DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     if (!close && !rgba) {
         return;
@@ -697,7 +697,7 @@ void chooseQueue(ID3D12CommandQueue* queue, std::chrono::steady_clock::time_poin
 }
 
 // The game's submission hook: retires released textures and submits a slot the staging thread has filled. No frame
-// copies here (3-4 MB per playing channel on the game's render thread stutters).
+// copies here (they ran here until 2026-10-22, 3-4 MB per playing channel on the game's render thread: stutter).
 void uploadFrame(ID3D12CommandQueue* queue)
 {
     std::unique_lock lock(g_mutex, std::try_to_lock);

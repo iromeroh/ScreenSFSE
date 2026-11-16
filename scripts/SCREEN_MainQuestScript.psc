@@ -15,7 +15,7 @@ Form Property RemoteTerminal Auto Const          ; TERM ScreenSFSE_RemoteTermina
 ObjectReference Property HeldRemoteTerminal Auto Const   ; REFR ScreenSFSE_RemoteTerminalRef 01000850, its only reference
 Bool Property RemoteGiven = False Auto Hidden
 Int Property RemoteScreen = 0 Auto Hidden        ; the screen the remote controls (form ID), kept until changed
-ObjectReference RemoteTerminalRef                ; a terminal placed at the player by earlier 0.3 builds
+ObjectReference RemoteTerminalRef                ; a terminal placed at the player by 0.3 builds before 2026-10-25
 
 ; Screens register with the DLL from their OnLoad, which the game does not run when a save loads in their own cell:
 ; RegisterNearbyScreens registers the loaded ones around the player (save load, cell load, opening the remote), so they
